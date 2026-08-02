@@ -74,25 +74,43 @@ static const int PORT_HIT = 11;   // 포트 잡히는 반경
 // ─────────────────────────────────────────────────────────────
 
 enum Type { SWITCH, LAMP, PIN_IN, PIN_OUT,
-            T_AND, T_OR, T_NOT, T_XOR, T_NAND, T_NOR, TYPE_N };
+            T_AND, T_OR, T_NOT, T_XOR, T_NAND, T_NOR,
+            CLOCK, BUNDLE, SPLIT, RAM, TYPE_N };
 
-struct TypeInfo { const char* name; int nIn; bool hasOut; uint32_t color; };
+struct TypeInfo { const char* name; int nIn; int nOut; uint32_t color; };
 
 static const TypeInfo TYPES[TYPE_N] = {
-    /* SWITCH  */ { "스위치", 0, true,  0x2E7D5B },
-    /* LAMP    */ { "전구",   1, false, 0x8A6D3B },
-    /* PIN_IN  */ { "입력핀", 0, true,  0x3E8ACC },   // 칩의 입력 포트가 된다
-    /* PIN_OUT */ { "출력핀", 1, false, 0xCC7A3E },   // 칩의 출력 포트가 된다
-    /* AND     */ { "AND",    2, true,  0x35688A },
-    /* OR      */ { "OR",     2, true,  0x35688A },
-    /* NOT     */ { "NOT",    1, true,  0x9A4A5A },
-    /* XOR     */ { "XOR",    2, true,  0x6A5AA0 },
-    /* NAND    */ { "NAND",   2, true,  0x4A6A44 },
-    /* NOR     */ { "NOR",    2, true,  0x4A6A44 },
+    /* SWITCH  */ { "스위치", 0, 1, 0x2E7D5B },
+    /* LAMP    */ { "전구",   1, 0, 0x8A6D3B },
+    /* PIN_IN  */ { "입력핀", 0, 1, 0x3E8ACC },   // 칩의 입력 포트가 된다
+    /* PIN_OUT */ { "출력핀", 1, 0, 0xCC7A3E },   // 칩의 출력 포트가 된다
+    /* AND     */ { "AND",    2, 1, 0x35688A },
+    /* OR      */ { "OR",     2, 1, 0x35688A },
+    /* NOT     */ { "NOT",    1, 1, 0x9A4A5A },
+    /* XOR     */ { "XOR",    2, 1, 0x6A5AA0 },
+    /* NAND    */ { "NAND",   2, 1, 0x4A6A44 },
+    /* NOR     */ { "NOR",    2, 1, 0x4A6A44 },
+    /* CLOCK   */ { "클럭",   0, 1, 0xC8963C },   // 박자를 준다
+    /* BUNDLE  */ { "묶음",   2, 1, 0x4E7E7E },   // 가는 선 여럿 → 굵은 선 하나
+    /* SPLIT   */ { "풀음",   1, 2, 0x4E7E7E },   // 굵은 선 하나 → 가는 선 여럿
+    /* RAM     */ { "램",     4, 1, 0x8A4E7E },   // 주소·데이터·쓰기·클럭 → 데이터
 };
 
 // 칩의 포트가 되는 부품
 static inline bool isPin(int type) { return type == PIN_IN || type == PIN_OUT; }
+// 폭을 사람이 정할 수 있는 부품 (aux 에 폭이 들어간다)
+static inline bool hasWidth(int type) {
+    return isPin(type) || type == BUNDLE || type == SPLIT;
+}
+
+// 램 크기
+static const int RAM_WORDS = 256;
+static const int RAM_ADDRW = 8;
+static const int RAM_DATAW = 8;
+
+// 클럭이 몇 틱마다 뒤집힐지 (aux 가 이 표의 자리)
+static const int CLOCK_TICKS[] = { 1, 2, 4, 8, 16, 32, 64 };
+static const int CLOCK_N = 7;
 
 // ─────────────────────────────────────────────────────────────
 // 회로 자료구조
@@ -103,15 +121,30 @@ static inline bool isPin(int type) { return type == PIN_IN || type == PIN_OUT; }
 
 struct SubSim;   // 앞선언
 
+// 신호는 이제 0/1 이 아니라 폭만큼의 수다. 폭 1이면 예전과 똑같이 0 아니면 1.
+// 8비트 선 하나가 예전의 선 여덟 가닥을 대신한다.
+typedef uint16_t Val;
+static const int WIDTH_MAX = 16;
+
+static inline Val maskTo(Val v, int w) {
+    if (w >= 16) return v;
+    return (Val)(v & ((1u << w) - 1));
+}
+
 struct Comp {
     int  type = -1;           // 붙박이면 Type, 커스텀 게이트면 -1 (chipId 로 구분)
     int  chipId = -1;         // chips[] 자리 (커스텀 게이트일 때)
     int  x = 0, y = 0;
     int  rot = 0;             // 0 = 출력이 오른쪽, 1 = 아래, 2 = 왼쪽, 3 = 위
+    int  aux = 0;             // 부품마다 뜻이 다른 값 (클럭 주기, 핀·묶음 폭 …)
+    int  tickAcc = 0;         // 클럭이 센 틱
+    uint8_t lastClk = 0;      // 램이 본 지난 클럭 (올라가는 순간을 잡으려고)
     std::string label;        // 핀 이름 (핀이 아니면 빈 칸)
-    std::vector<uint8_t> in;       // 이번 틱 입력값들
-    std::vector<uint8_t> out;      // 지금 출력값들
-    std::vector<uint8_t> nextOut;  // 다음 틱에 반영될 값
+    std::vector<Val>     in;       // 이번 틱 입력값들
+    std::vector<Val>     out;      // 지금 출력값들
+    std::vector<Val>     nextOut;  // 다음 틱에 반영될 값
+    std::vector<uint8_t> inW, outW;   // 포트마다의 폭 (1~16)
+    std::vector<Val>     mem;      // 램의 속 (램이 아니면 비어 있다)
     bool alive = true;
     std::shared_ptr<SubSim> sub;   // 커스텀 게이트의 속 회로 (인스턴스마다 따로)
 };
@@ -143,13 +176,69 @@ static const uint32_t CHIP_COLORS[] = {
     0x4C7A9E, 0x9E7A4C, 0x6E9E4C, 0x9E4C7A, 0x4C9E8E, 0x7A4C9E, 0x9E5A4C, 0x5A5A9E,
 };
 
+// 폭을 정할 수 있는 부품의 폭 (aux). 없으면 1.
+static int widthOf(const Comp& c) {
+    if (!hasWidth(c.type) || c.chipId >= 0) return 1;
+    return std::clamp(c.aux <= 0 ? 1 : c.aux, 1, WIDTH_MAX);
+}
+
 // 입력·출력 포트 수
 static int nIn(const Comp& c)  {
-    return c.chipId >= 0 ? (int)chips[c.chipId].tmpl.inPorts.size() : TYPES[c.type].nIn;
+    if (c.chipId >= 0) return (int)chips[c.chipId].tmpl.inPorts.size();
+    if (c.type == BUNDLE) return widthOf(c);      // 가는 선 폭만큼 받는다
+    if (c.type == SPLIT)  return 1;
+    return TYPES[c.type].nIn;
 }
 static int nOut(const Comp& c) {
-    return c.chipId >= 0 ? (int)chips[c.chipId].tmpl.outPorts.size()
-                         : (TYPES[c.type].hasOut ? 1 : 0);
+    if (c.chipId >= 0) return (int)chips[c.chipId].tmpl.outPorts.size();
+    if (c.type == BUNDLE) return 1;
+    if (c.type == SPLIT)  return widthOf(c);      // 폭만큼 내보낸다
+    return TYPES[c.type].nOut;
+}
+
+// 포트 하나의 폭
+static int inWidth(const Comp& c, int port) {
+    if (c.chipId >= 0) {
+        const SubSim& t = chips[c.chipId].tmpl;
+        if (port >= 0 && port < (int)t.inPorts.size()) {
+            int i = t.inPorts[port];
+            if (i >= 0 && i < (int)t.comps.size()) return widthOf(t.comps[i]);
+        }
+        return 1;
+    }
+    if (c.type == PIN_OUT) return widthOf(c);
+    if (c.type == SPLIT)   return widthOf(c);     // 굵은 선을 받는다
+    if (c.type == BUNDLE)  return 1;              // 가는 선들을 받는다
+    if (c.type == RAM)     return (port == 0) ? RAM_ADDRW : (port == 1) ? RAM_DATAW : 1;
+    return 1;
+}
+static int outWidth(const Comp& c, int port) {
+    if (c.chipId >= 0) {
+        const SubSim& t = chips[c.chipId].tmpl;
+        if (port >= 0 && port < (int)t.outPorts.size()) {
+            int i = t.outPorts[port];
+            if (i >= 0 && i < (int)t.comps.size()) return widthOf(t.comps[i]);
+        }
+        return 1;
+    }
+    if (c.type == PIN_IN)  return widthOf(c);
+    if (c.type == BUNDLE)  return widthOf(c);     // 굵은 선을 내보낸다
+    if (c.type == SPLIT)   return 1;
+    if (c.type == RAM)     return RAM_DATAW;
+    return 1;
+}
+
+// 포트 크기가 바뀌었을 때 값 그릇을 다시 맞춘다
+static void resizePorts(Comp& c) {
+    int ni = nIn(c), no = nOut(c);
+    c.in.assign(ni, 0);
+    c.out.resize(no, 0); c.out.resize(no);
+    c.nextOut.assign(no, 0);
+    c.inW.resize(ni); c.outW.resize(no);
+    for (int i = 0; i < ni; ++i) c.inW[i]  = (uint8_t)inWidth(c, i);
+    for (int i = 0; i < no; ++i) c.outW[i] = (uint8_t)outWidth(c, i);
+    for (int i = 0; i < no; ++i) c.out[i] = maskTo(c.out[i], c.outW[i]);
+    if (c.type == RAM && (int)c.mem.size() != RAM_WORDS) c.mem.assign(RAM_WORDS, 0);
 }
 static const char* compName(const Comp& c) {
     if (c.chipId >= 0) return chips[c.chipId].name.c_str();
@@ -177,9 +266,8 @@ static uint32_t compColor(const Comp& c) {
 
 static int addComp(SubSim& s, int type, int x, int y) {
     Comp c; c.type = type; c.chipId = -1; c.x = x; c.y = y;
-    c.in.assign(TYPES[type].nIn, 0);
-    int no = TYPES[type].hasOut ? 1 : 0;
-    c.out.assign(no, 0); c.nextOut.assign(no, 0);
+    if (hasWidth(type)) c.aux = (type == BUNDLE || type == SPLIT) ? 8 : 1;
+    resizePorts(c);
     // 핀은 이름이 있어야 뜻이 있다. 없으면 안 겹치게 번호를 붙여 준다.
     if (isPin(type)) {
         int n = 0;
@@ -195,9 +283,7 @@ static SubSim deepCopy(const SubSim& s);   // 앞선언
 static int addChip(SubSim& s, int chipId, int x, int y) {
     Comp c; c.type = -1; c.chipId = chipId; c.x = x; c.y = y;
     c.sub = std::make_shared<SubSim>(deepCopy(chips[chipId].tmpl));
-    int ni = (int)chips[chipId].tmpl.inPorts.size();
-    int no = (int)chips[chipId].tmpl.outPorts.size();
-    c.in.assign(ni, 0); c.out.assign(no, 0); c.nextOut.assign(no, 0);
+    resizePorts(c);
     s.comps.push_back(std::move(c));
     return (int)s.comps.size() - 1;
 }
@@ -216,8 +302,19 @@ static SubSim deepCopy(const SubSim& s) {
 }
 
 // 입력 포트 하나엔 선 하나. 이미 있으면 끊고 갈아탄다.
+// 폭이 다른 포트는 못 잇는다 (굵은 선을 가는 구멍에 꽂을 수 없다)
+static bool wireFits(const SubSim& s, int from, int fromPort, int to, int toPort) {
+    if (from < 0 || from >= (int)s.comps.size() || to < 0 || to >= (int)s.comps.size()) return false;
+    const Comp& a = s.comps[from];
+    const Comp& b = s.comps[to];
+    if (fromPort < 0 || fromPort >= (int)a.outW.size()) return false;
+    if (toPort   < 0 || toPort   >= (int)b.inW.size())  return false;
+    return a.outW[fromPort] == b.inW[toPort];
+}
+
 static void addWire(SubSim& s, int from, int fromPort, int to, int toPort) {
     if (from == to) return;
+    if (!wireFits(s, from, fromPort, to, toPort)) return;
     for (auto& w : s.wires)
         if (w.alive && w.to == to && w.toPort == toPort) w.alive = false;
     s.wires.push_back({ from, fromPort, to, toPort, true });
@@ -251,8 +348,10 @@ static void tickSub(SubSim& s) {
         if (w.from < 0 || w.from >= n || w.to < 0 || w.to >= n) continue;
         Comp& src = s.comps[w.from]; Comp& dst = s.comps[w.to];
         if (!src.alive || !dst.alive) continue;
-        if (w.fromPort < (int)src.out.size() && w.toPort < (int)dst.in.size())
-            dst.in[w.toPort] |= src.out[w.fromPort];
+        if (w.fromPort < (int)src.out.size() && w.toPort < (int)dst.in.size()) {
+            int wd = (w.toPort < (int)dst.inW.size()) ? dst.inW[w.toPort] : 1;
+            dst.in[w.toPort] = maskTo(dst.in[w.toPort] | src.out[w.fromPort], wd);
+        }
     }
 
     for (auto& c : s.comps) {
@@ -273,8 +372,8 @@ static void tickSub(SubSim& s) {
                                ? sub.comps[pin].in[0] : 0;
             }
         } else {
-            uint8_t a = c.in.size() > 0 ? c.in[0] : 0;
-            uint8_t b = c.in.size() > 1 ? c.in[1] : 0;
+            Val a = c.in.size() > 0 ? c.in[0] : 0;
+            Val b = c.in.size() > 1 ? c.in[1] : 0;
             switch (c.type) {
                 // 스위치와 입력핀은 밖에서 정해 준 값을 그대로 들고 있는다
                 case SWITCH:
@@ -284,10 +383,52 @@ static void tickSub(SubSim& s) {
                 case T_NOT:  c.nextOut[0] = !a;         break;
                 case T_AND:  c.nextOut[0] = a && b;     break;
                 case T_OR:   c.nextOut[0] = a || b;     break;
-                case T_XOR:  c.nextOut[0] = a != b;     break;
+                case T_XOR:  c.nextOut[0] = (a != 0) != (b != 0); break;
                 case T_NAND: c.nextOut[0] = !(a && b);  break;
                 case T_NOR:  c.nextOut[0] = !(a || b);  break;
+
+                // 클럭은 제 박자대로 혼자 뒤집힌다. 값은 out 에 들고 있고
+                // aux 의 아랫자리는 주기, 윗자리는 지금까지 센 틱이다.
+                case CLOCK: {
+                    int per = CLOCK_TICKS[std::clamp(c.aux, 0, CLOCK_N - 1)];
+                    ++c.tickAcc;
+                    Val now = c.out.empty() ? 0 : c.out[0];
+                    if (c.tickAcc >= per) { c.tickAcc = 0; now = now ? 0 : 1; }
+                    c.nextOut[0] = now;
+                    break;
+                }
+
+                // 가는 선 여럿을 굵은 선 하나로. 0번 입력이 제일 아랫자리.
+                case BUNDLE: {
+                    Val v = 0;
+                    for (int i = 0; i < (int)c.in.size() && i < WIDTH_MAX; ++i)
+                        if (c.in[i]) v |= (Val)(1u << i);
+                    c.nextOut[0] = maskTo(v, widthOf(c));
+                    break;
+                }
+                // 굵은 선 하나를 가는 선 여럿으로
+                case SPLIT: {
+                    for (int i = 0; i < (int)c.nextOut.size() && i < WIDTH_MAX; ++i)
+                        c.nextOut[i] = (a >> i) & 1;
+                    break;
+                }
+
+                // 램: 주소·데이터·쓰기·클럭을 받는다.
+                // 읽기는 늘 (주소 자리의 값이 그대로 나온다), 쓰기는 클럭이 올라갈 때만.
+                case RAM: {
+                    Val addr = a, dataIn = b;
+                    Val we   = c.in.size() > 2 ? c.in[2] : 0;
+                    Val clk  = c.in.size() > 3 ? c.in[3] : 0;
+                    if (c.mem.size() != (size_t)RAM_WORDS) c.mem.assign(RAM_WORDS, 0);
+                    if (we && clk && !c.lastClk)                  // 올라가는 순간에만 쓴다
+                        c.mem[addr % RAM_WORDS] = maskTo(dataIn, RAM_DATAW);
+                    c.lastClk = clk ? 1 : 0;
+                    c.nextOut[0] = c.mem[addr % RAM_WORDS];
+                    break;
+                }
             }
+            for (size_t i = 0; i < c.nextOut.size(); ++i)
+                c.nextOut[i] = maskTo(c.nextOut[i], i < c.outW.size() ? c.outW[i] : 1);
         }
     }
 
@@ -296,8 +437,14 @@ static void tickSub(SubSim& s) {
 
 // 부품의 켜짐 여부 (표시·읽기용). 출력 있으면 out[0], 전구는 in[0].
 static bool lit(const Comp& c) {
-    if (c.type == LAMP || c.type == PIN_OUT) return !c.in.empty() && c.in[0];
-    return !c.out.empty() && c.out[0];
+    if (c.type == LAMP || c.type == PIN_OUT) return !c.in.empty() && c.in[0] != 0;
+    return !c.out.empty() && c.out[0] != 0;
+}
+// 부품이 보여 줄 값 (굵은 선이면 수, 아니면 0/1)
+static Val shownVal(const Comp& c) {
+    if (c.type == LAMP || c.type == PIN_OUT || c.type == SPLIT)
+        return c.in.empty() ? 0 : c.in[0];
+    return c.out.empty() ? 0 : c.out[0];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -378,9 +525,7 @@ static int refreshChip(SubSim& s, int chipId) {
         if (!c.alive) continue;
         if (c.chipId == chipId) {
             c.sub = std::make_shared<SubSim>(deepCopy(chips[chipId].tmpl));
-            c.in.assign(ni, 0);
-            c.out.assign(no, 0);
-            c.nextOut.assign(no, 0);
+            resizePorts(c);
             // 없어진 포트에 걸린 선을 끊는다
             for (auto& w : s.wires) {
                 if (!w.alive) continue;
@@ -775,15 +920,31 @@ static void wireCurve(const Wire& w, int out[][2], int n);
 
 // 도구 자리: 0 = 손, 1..TYPE_N = 붙박이, 그 뒤 = 살아 있는 칩들
 static int toolCount() { return 1 + TYPE_N + (int)liveChips().size(); }
-// 부품이 많아지면 줄을 좁혀서 다 보이게 한다 (칩이 쌓일수록 목록이 길어진다)
+// 부품이 많아지면 줄을 좁힌다. 그래도 넘치면 휠로 굴려 본다.
+static int toolTop()  { return S(42); }
+static int toolBot()  { return (WIN_H - S(84)) - S(6); }   // 아래 단추들 위
 static int toolPitch() {
-    int room = (WIN_H - S(84)) - S(6) - S(42);      // 아래 단추들 위까지
+    int room = toolBot() - toolTop();
     int n = std::max(1, toolCount());
-    return std::clamp(room / n, S(21), S(30));
+    return std::clamp(room / n, S(22), S(30));
 }
+static int toolScroll = 0;        // 목록을 얼마나 굴렸나 (픽셀)
+
+// 다 못 보여 줄 때 굴릴 수 있는 최대
+static int toolScrollMax() {
+    int need = toolCount() * toolPitch();
+    return std::max(0, need - (toolBot() - toolTop()));
+}
+static void clampToolScroll() { toolScroll = std::clamp(toolScroll, 0, toolScrollMax()); }
+
 static Rect toolRect(int i) {
     int p = toolPitch();
-    return { S(10), S(42) + i * p, PANEL_W - S(20), p - S(3) };
+    return { S(10), toolTop() + i * p - toolScroll, PANEL_W - S(20), p - S(3) };
+}
+// 그 줄이 보이는 자리에 있나
+static bool toolVisible(int i) {
+    Rect r = toolRect(i);
+    return r.y >= toolTop() - r.h / 2 && r.y + r.h <= toolBot() + r.h / 2;
 }
 
 // 도구 자리가 칩이면 그 chipId, 아니면 -1
@@ -922,20 +1083,174 @@ static bool uiOn = true;      // 좌우 판을 보여 줄까 (Tab)
 
 // 과정을 고치면(단계를 쪼개거나 순서를 바꾸면) 저장된 진도가 엉뚱한 단계를 가리킨다.
 // 이 번호를 올려 두면 진도만 처음으로 되돌리고, 얻어 둔 칩은 그대로 둔다.
-static const int COURSE_VER = 2;
+static const int COURSE_VER = 3;
+
+// 기억하는 회로는 진리표로 못 잰다. 값을 차례로 넣어 보며 그때그때 확인해야 한다.
+// 한 칸이 "이 값들을 넣고 몇 틱 돌린 뒤, 이 출력이 이 값이어야 한다" 를 뜻한다.
+struct Step {
+    Val  in[4];        // 입력핀에 넣을 값
+    Val  want[3];      // 출력핀에서 바라는 값
+    uint8_t check;     // 어느 출력을 볼지 (비트 0 = 첫째 출력 …). 0 이면 안 본다
+    uint8_t ticks;     // 넣고 몇 틱 돌릴지 (0 이면 기본값)
+    const char* note;  // 못 맞췄을 때 같이 보여 줄 말
+};
+
+static const int LES_IN_MAX = 4, LES_OUT_MAX = 3;
 
 struct Lesson {
     const char* name;      // 통과하면 이 이름의 칩이 된다
     const char* title;
     const char* text;      // 설명 (\n 으로 줄 나눔)
     int  nIn, nOut;
-    const char* inName[3];
-    const char* outName[2];
-    // 진리표: 입력 조합 2^nIn 개마다 원하는 출력 비트들
+    const char* inName[LES_IN_MAX];
+    const char* outName[LES_OUT_MAX];
+    // 진리표: 입력 조합 2^nIn 개마다 원하는 출력 비트들 (script 가 있으면 안 쓴다)
     uint8_t want[8][2];
     const char* allow;     // 이 단계에서 쓸 수 있는 부품 (빈 칸이면 다)
     bool  bank;            // 통과하면 칩으로 남길까 (이해 단계는 안 남긴다)
     const char* hint;      // 막혔을 때 보여 줄 귀띔 (답을 다 알려 주지는 않는다)
+    // 여기부터는 뒤에 생긴 것들 — 안 적으면 0 이 되어 예전처럼 돈다
+    int  inW[LES_IN_MAX];  // 입력핀 폭 (0 이면 1)
+    int  outW[LES_OUT_MAX];
+    const Step* script;    // 있으면 진리표 대신 이걸로 잰다
+    int  nStep;
+    const Val* program;    // 판에 놓인 램에 미리 넣어 둘 프로그램
+    int  nProg;
+};
+
+// ── 기억하는 단계들의 검사 대본 ──
+// 셋·리셋을 잠깐씩 주고, 뗀 뒤에도 값이 남아 있는지 본다.
+static const Step LAT_SCRIPT[] = {
+    { {0,0}, {0}, 0, 0, nullptr },                       // 처음엔 아무 값이나
+    { {1,0}, {1}, 1, 0, "셋을 켜면 Q 가 켜져야 한다" },
+    { {0,0}, {1}, 1, 0, "셋을 떼도 켜진 채로 있어야 한다" },
+    { {0,1}, {0}, 1, 0, "리셋을 켜면 꺼져야 한다" },
+    { {0,0}, {0}, 1, 0, "리셋을 떼도 꺼진 채로 있어야 한다" },
+    { {1,0}, {1}, 1, 0, "다시 셋을 켜면 켜져야 한다" },
+};
+
+// 받아라가 켜져 있을 때만 값이 통하고, 꺼지면 붙잡고 있어야 한다.
+static const Step DLAT_SCRIPT[] = {
+    { {0,1}, {0}, 1, 0, "값 0 을 받는다" },
+    { {1,1}, {1}, 1, 0, "받아라가 켜져 있으면 값이 그대로 통한다" },
+    { {1,0}, {1}, 1, 0, "받아라를 끄면 그 값을 붙잡는다" },
+    { {0,0}, {1}, 1, 0, "꺼져 있으면 값이 바뀌어도 안 바뀐다" },
+    { {0,1}, {0}, 1, 0, "다시 켜면 새 값을 받는다" },
+    { {1,0}, {0}, 1, 0, "끈 뒤에는 값이 와도 안 통한다" },
+    { {1,1}, {1}, 1, 0, "켜면 다시 통한다" },
+};
+
+// 마스터-슬레이브: 클럭이 올라가는 그 순간의 값만 잡는다.
+// D래치와 다른 점은 4번째 — 올라간 뒤에 값이 바뀌어도 안 통한다.
+static const Step FF_SCRIPT[] = {
+    { {0,1}, {0}, 0, 0, nullptr },      // 먼저 0 을 한 번 밀어 넣어 자리를 잡는다
+    { {0,0}, {0}, 1, 0, "처음엔 0" },
+    { {1,0}, {0}, 1, 0, "클럭이 아직 안 올라갔으니 그대로" },
+    { {1,1}, {1}, 1, 0, "올라가는 순간의 값을 잡는다" },
+    { {0,1}, {1}, 1, 0, "올라간 뒤에 값이 바뀌어도 안 통해야 한다" },
+    { {0,0}, {1}, 1, 0, "내려가도 그대로" },
+    { {0,1}, {0}, 1, 0, "다음에 올라갈 때 새 값" },
+    { {1,1}, {0}, 1, 0, "또 안 통한다" },
+};
+
+// 8비트짜리. 값이 수로 오간다.
+static const Step REG_SCRIPT[] = {
+    { {0,1},   {0},   0, 0, nullptr },  // 0 을 한 번 밀어 넣어 자리를 잡는다
+    { {0,0},   {0},   1, 0, "처음엔 0" },
+    { {181,0}, {0},   1, 0, "클럭이 안 올라갔으니 아직" },
+    { {181,1}, {181}, 1, 0, "올라가는 순간 181 을 잡는다" },
+    { {7,1},   {181}, 1, 0, "올라간 뒤 값이 바뀌어도 그대로" },
+    { {7,0},   {181}, 1, 0, "내려가도 그대로" },
+    { {7,1},   {7},   1, 0, "다음에 올라갈 때 7" },
+    { {255,1}, {7},   1, 0, "또 안 통한다" },
+};
+
+// 8비트 덧셈기: 두 수를 더해 결과와 자리올림을 낸다
+static const Step ADD8_SCRIPT[] = {
+    { {0,0},     {0,0},     3, 0, "0+0" },
+    { {1,1},     {2,0},     3, 0, "1+1 = 2" },
+    { {181,7},   {188,0},   3, 0, "181+7 = 188" },
+    { {200,100}, {44,1},    3, 0, "200+100 = 300 → 44 에 자리올림 1" },
+    { {255,1},   {0,1},     3, 0, "255+1 = 256 → 0 에 자리올림 1" },
+    { {255,255}, {254,1},   3, 0, "255+255 = 510 → 254 에 자리올림 1" },
+};
+
+// 세는 상자: 클럭이 올라갈 때마다 1씩 는다. 되돌리기를 켜면 0 으로.
+static const Step CNT_SCRIPT[] = {
+    { {0,1}, {0}, 0, 0, nullptr },                    // 되돌리기를 켠 채로
+    { {1,1}, {0}, 1, 0, "되돌리는 중에 클럭이 올라가면 0" },
+    { {0,0}, {0}, 1, 0, "되돌리기를 뗀다" },
+    { {1,0}, {1}, 1, 0, "클럭이 올라가면 1" },
+    { {0,0}, {1}, 1, 0, "내려갈 땐 그대로" },
+    { {1,0}, {2}, 1, 0, "또 올라가면 2" },
+    { {0,0}, {2}, 1, 0, "그대로" },
+    { {1,0}, {3}, 1, 0, "3" },
+    { {0,0}, {3}, 1, 0, "그대로" },
+    { {0,1}, {3}, 0, 0, nullptr },                    // 되돌리기 켜고
+    { {1,1}, {0}, 1, 0, "다시 0 으로" },
+};
+
+// 계산기: 빼기를 켜면 A-B, 끄면 A+B
+static const Step ALU_SCRIPT[] = {
+    { {5,3,0},   {8},   1, 0, "5+3 = 8" },
+    { {5,3,1},   {2},   1, 0, "5-3 = 2" },
+    { {200,100,0},{44}, 1, 0, "200+100 은 넘쳐서 44" },
+    { {10,10,1}, {0},   1, 0, "10-10 = 0" },
+    { {3,5,1},   {254}, 1, 0, "3-5 는 음수라 254 (2의 보수)" },
+    { {255,1,0}, {0},   1, 0, "255+1 = 0" },
+};
+
+// 명령 해독기: 명령 번호를 받아 어느 선을 켤지 정한다
+static const Step DEC_SCRIPT[] = {
+    { {0}, {1,0,0}, 7, 0, "0 = 멈춤" },
+    { {1}, {0,1,0}, 7, 0, "1 = 불러오기" },
+    { {2}, {0,0,1}, 7, 0, "2 = 더하기" },
+    { {3}, {0,0,0}, 7, 0, "3 = 아무것도 아님" },
+};
+
+// 누산기: 클럭이 올라갈 때 값을 받거나(더할까=0) 더한다(더할까=1)
+static const Step ACC_SCRIPT[] = {
+    { {0,0,0}, {0}, 0, 0, nullptr },
+    { {1,0,0}, {0}, 1, 0, "0 을 넣어 자리를 잡는다" },
+    { {0,20,0}, {0}, 1, 0, "클럭이 안 올라갔으니 아직" },
+    { {1,20,0}, {20}, 1, 0, "더할까가 꺼져 있으면 그냥 넣는다" },
+    { {0,22,1}, {20}, 1, 0, "아직" },
+    { {1,22,1}, {42}, 1, 0, "더할까가 켜져 있으면 더한다 (20+22)" },
+    { {0,1,1},  {42}, 1, 0, "그대로" },
+    { {1,1,1},  {43}, 1, 0, "또 더하면 43" },
+    { {1,7,0},  {43}, 1, 0, "클럭이 이미 올라가 있으면 안 바뀐다" },
+    { {0,7,0},  {43}, 1, 0, "내려가도 그대로" },
+    { {1,7,0},  {7},  1, 0, "다시 올라갈 때 7 을 넣는다" },
+};
+
+// 컴퓨터가 돌릴 프로그램. 한 바이트가 명령 하나다.
+//   윗 2비트 = 무엇을, 아랫 6비트 = 어떤 수로
+//   1 = 넣기, 2 = 더하기, 0 = 멈춤
+static const Val CPU_PROG[] = {
+    (1u << 6) | 20,     // 누산기 = 20
+    (2u << 6) | 22,     // 누산기 += 22   → 42
+    0,                  // 멈춤
+};
+
+// 컴퓨터: 램에 넣어 둔 프로그램을 스스로 읽어 돈다.
+// 프로그램(램에 미리 넣어 둔다):
+//   0번: 1 (불러오기) → 5번 자리의 값을 누산기에
+//   1번: 5
+//   2번: 2 (더하기)   → 6번 자리의 값을 누산기에 더함
+//   3번: 6
+//   4번: 0 (멈춤)
+//   5번: 20,  6번: 22   →  20 + 22 = 42
+static const Step CPU_SCRIPT[] = {
+    { {0,1}, {0},  0, 0, nullptr },             // 되돌리기를 켠 채로
+    { {1,1}, {0},  0, 0, nullptr },             // 세는상자를 0 으로
+    { {0,0}, {0},  0, 0, nullptr },             // 되돌리기 뗌 — 0번 명령을 보는 중
+    { {1,0}, {20}, 1, 0, "첫 명령(넣기 20)이 돌면 누산기가 20" },
+    { {0,0}, {20}, 1, 0, "그대로" },
+    { {1,0}, {42}, 1, 0, "둘째 명령(더하기 22)이 돌면 42" },
+    { {0,0}, {42}, 1, 0, "그대로" },
+    { {1,0}, {42}, 1, 0, "셋째는 멈춤이라 안 바뀐다" },
+    { {0,0}, {42}, 1, 0, "42 그대로" },
+    { {1,0}, {42}, 1, 0, "계속 멈춰 있어야 한다" },
 };
 
 static const Lesson LESSONS[] = {
@@ -948,7 +1263,8 @@ static const Lesson LESSONS[] = {
       "켜면 켜지고, 끄면 꺼진다.",
       1, 1, { "들어옴" }, { "나감" },
       { {0}, {1} }, "게이트 없이", false,
-      "입력핀 오른쪽 가장자리에 작은 동그라미가 있다.\n그걸 눌러서 출력핀 왼쪽 동그라미까지 끌면 이어진다." },
+      "입력핀 오른쪽 가장자리에 작은 동그라미가 있다.\n그걸 눌러서 출력핀 왼쪽 동그라미까지 끌면 이어진다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "2. 하나가 둘을",
       "한 출력에서 나온 선은 여러 곳에 이어도 된다.\n"
@@ -956,7 +1272,8 @@ static const Lesson LESSONS[] = {
       "입력 하나로 출력 둘을 같이 켜 보자.",
       1, 2, { "들어옴" }, { "왼쪽", "오른쪽" },
       { {0,0}, {1,1} }, "게이트 없이", false,
-      "같은 동그라미에서 선을 두 번 끌면 된다.\n첫 선을 이은 뒤 그 동그라미를 다시 잡아라." },
+      "같은 동그라미에서 선을 두 번 끌면 된다.\n첫 선을 이은 뒤 그 동그라미를 다시 잡아라.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     // ── 2부. 게이트 하나씩 (직접 써 보며 익힌다) ──
     { "", "3. AND — 둘 다",
@@ -966,7 +1283,8 @@ static const Lesson LESSONS[] = {
       "AND 를 하나 놓고 표대로 되는지 보자.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {0}, {0}, {1} }, "AND", false,
-      "왼쪽 목록에서 AND 를 고르고 판을 누르면 놓인다.\n왼쪽 두 점이 입력, 오른쪽 한 점이 출력이다." },
+      "왼쪽 목록에서 AND 를 고르고 판을 누르면 놓인다.\n왼쪽 두 점이 입력, 오른쪽 한 점이 출력이다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "4. OR — 하나만이라도",
       "OR 은 둘 중 하나만 켜져도 켜진다.\n"
@@ -974,7 +1292,8 @@ static const Lesson LESSONS[] = {
       "'또는' 이다.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {1}, {1}, {1} }, "OR", false,
-      "AND 때와 똑같이 놓고 이으면 된다.\n표만 다르지 손은 같다." },
+      "AND 때와 똑같이 놓고 이으면 된다.\n표만 다르지 손은 같다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "5. NOT — 뒤집기",
       "NOT 은 입력이 하나뿐이고 그것을 뒤집는다.\n"
@@ -982,7 +1301,8 @@ static const Lesson LESSONS[] = {
       "'아니다' 다.",
       1, 1, { "A" }, { "결과" },
       { {1}, {0} }, "NOT", false,
-      "NOT 은 왼쪽 점이 하나뿐이다.\n입력핀 하나를 거기 이으면 끝난다." },
+      "NOT 은 왼쪽 점이 하나뿐이다.\n입력핀 하나를 거기 이으면 끝난다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "6. XOR — 다를 때만",
       "XOR 은 둘이 서로 다를 때만 켜진다.\n"
@@ -990,7 +1310,8 @@ static const Lesson LESSONS[] = {
       "'둘 중 하나만' 이다. 나중에 덧셈에 쓰인다.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {1}, {1}, {0} }, "XOR", false,
-      "XOR 을 놓고 A 와 B 를 양쪽에 이어라.\nOR 과 달리 둘 다 켜지면 꺼지는지 눌러 보자." },
+      "XOR 을 놓고 A 와 B 를 양쪽에 이어라.\nOR 과 달리 둘 다 켜지면 꺼지는지 눌러 보자.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "7. NAND — AND 의 반대",
       "NAND 는 AND 뒤에 NOT 을 붙인 것이다.\n"
@@ -999,7 +1320,8 @@ static const Lesson LESSONS[] = {
       "뒤에서 그걸 해 본다.",
       2, 1, { "A", "B" }, { "결과" },
       { {1}, {1}, {1}, {0} }, "NAND", false,
-      "NAND 를 놓고 A, B 를 이어라.\n표를 보면 AND 를 위아래로 뒤집은 모양이다." },
+      "NAND 를 놓고 A, B 를 이어라.\n표를 보면 AND 를 위아래로 뒤집은 모양이다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "8. NOR — OR 의 반대",
       "NOR 은 OR 뒤에 NOT 을 붙인 것이다.\n"
@@ -1007,7 +1329,8 @@ static const Lesson LESSONS[] = {
       "NOR 두 개를 서로 물리면 값을 기억하게 된다.",
       2, 1, { "A", "B" }, { "결과" },
       { {1}, {0}, {0}, {0} }, "NOR", false,
-      "NOR 을 놓고 A, B 를 이어라.\n둘 다 꺼졌을 때만 켜지는지 확인하자." },
+      "NOR 을 놓고 A, B 를 이어라.\n둘 다 꺼졌을 때만 켜지는지 확인하자.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     // ── 3부. 여러 개 이어 쓰기 ──
     { "", "9. 셋 다 켜졌을 때",
@@ -1017,14 +1340,16 @@ static const Lesson LESSONS[] = {
       "게이트의 출력은 다른 게이트의 입력이 될 수 있다.",
       3, 1, { "A", "B", "C" }, { "결과" },
       { {0}, {0}, {0}, {0}, {0}, {0}, {0}, {1} }, "AND", false,
-      "AND 두 개를 쓴다.\n첫 AND 에 A 와 B,\n둘째 AND 에 '첫 AND 의 출력' 과 C." },
+      "AND 두 개를 쓴다.\n첫 AND 에 A 와 B,\n둘째 AND 에 '첫 AND 의 출력' 과 C.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "10. 셋 중 하나라도",
       "이번엔 OR 로 같은 것을 해 보자.\n"
       "셋 중 하나만 켜져도 켜진다.",
       3, 1, { "A", "B", "C" }, { "결과" },
       { {0}, {1}, {1}, {1}, {1}, {1}, {1}, {1} }, "OR", false,
-      "9단계와 똑같은 모양인데 AND 대신 OR 을 쓴다." },
+      "9단계와 똑같은 모양인데 AND 대신 OR 을 쓴다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "", "11. 다수결",
       "셋 중 둘 이상이 켜지면 켜진다.\n\n"
@@ -1032,7 +1357,8 @@ static const Lesson LESSONS[] = {
       "그 중 하나라도 둘 다 켜졌으면 된다.",
       3, 1, { "A", "B", "C" }, { "결과" },
       { {0}, {0}, {0}, {1}, {0}, {1}, {1}, {1} }, "AND OR", false,
-      "AND 셋으로 A와B, B와C, A와C 를 각각 본다.\n그 셋 중 하나라도 켜지면 되니까\nOR 둘로 묶는다." },
+      "AND 셋으로 A와B, B와C, A와C 를 각각 본다.\n그 셋 중 하나라도 켜지면 되니까\nOR 둘로 묶는다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     // ── 4부. NAND 하나로 다시 만들기 ──
     { "NOT짜기", "12. NAND 로 NOT",
@@ -1042,7 +1368,8 @@ static const Lesson LESSONS[] = {
       "통과하면 이 회로가 부품이 되어 다음 단계에서 쓰인다.",
       1, 1, { "A" }, { "결과" },
       { {1}, {0} }, "NAND", true,
-      "NAND 의 두 입력에 같은 것을 넣는다.\n입력핀의 출력 동그라미에서\n선을 두 번 끌면 된다." },
+      "NAND 의 두 입력에 같은 것을 넣는다.\n입력핀의 출력 동그라미에서\n선을 두 번 끌면 된다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "AND짜기", "13. NAND 로 AND",
       "NAND 는 AND 를 뒤집은 것이다.\n"
@@ -1050,7 +1377,8 @@ static const Lesson LESSONS[] = {
       "앞 단계에서 만든 NOT짜기 를 쓸 수 있다.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {0}, {0}, {1} }, "NAND NOT짜기", true,
-      "NAND(A,B) 는 AND 를 뒤집은 값이다.\n그 결과를 NOT짜기 에 한 번 더 통과시켜라." },
+      "NAND(A,B) 는 AND 를 뒤집은 값이다.\n그 결과를 NOT짜기 에 한 번 더 통과시켜라.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "OR짜기", "14. NAND 로 OR",
       "드모르간 법칙:\n"
@@ -1058,7 +1386,8 @@ static const Lesson LESSONS[] = {
       "두 입력을 각각 뒤집어서 NAND 에 넣어 보자.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {1}, {1}, {1} }, "NAND NOT짜기", true,
-      "A 와 B 를 각각 NOT짜기 에 통과시킨다.\n그 둘을 NAND 에 넣으면 OR 이 된다." },
+      "A 와 B 를 각각 NOT짜기 에 통과시킨다.\n그 둘을 NAND 에 넣으면 OR 이 된다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "XOR짜기", "15. NAND 로 XOR",
       "다를 때만 켜진다는 것은\n"
@@ -1067,7 +1396,8 @@ static const Lesson LESSONS[] = {
       "앞의 것과 NAND 를 AND짜기 로 묶어 보자.",
       2, 1, { "A", "B" }, { "결과" },
       { {0}, {1}, {1}, {0} }, "NAND NOT짜기 AND짜기 OR짜기", true,
-      "'하나라도 켜짐' 은 OR짜기(A,B),\n'둘 다는 아님' 은 NAND(A,B) 다.\n그 둘을 AND짜기 로 묶어라." },
+      "'하나라도 켜짐' 은 OR짜기(A,B),\n'둘 다는 아님' 은 NAND(A,B) 다.\n그 둘을 AND짜기 로 묶어라.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     // ── 5부. 덧셈 ──
     { "반가산기", "16. 한 자리 덧셈",
@@ -1077,7 +1407,8 @@ static const Lesson LESSONS[] = {
       "표를 잘 보면 합은 XOR, 올림은 AND 다.",
       2, 2, { "A", "B" }, { "합", "올림" },
       { {0,0}, {1,0}, {1,0}, {0,1} }, "", true,
-      "합과 올림은 서로 상관없는 두 회로다.\n합 = XOR(A,B),  올림 = AND(A,B).\nA 와 B 에서 선을 두 번씩 끌면 된다." },
+      "합과 올림은 서로 상관없는 두 회로다.\n합 = XOR(A,B),  올림 = AND(A,B).\nA 와 B 에서 선을 두 번씩 끌면 된다.",
+      {}, {}, nullptr, 0, nullptr, 0 },
 
     { "전가산기", "17. 자리올림까지 받기",
       "여러 자리를 더하려면 아랫자리에서 올라온\n"
@@ -1086,7 +1417,124 @@ static const Lesson LESSONS[] = {
       "반가산기 두 개와 OR 하나면 된다.",
       3, 2, { "A", "B", "올림입력" }, { "합", "올림" },
       { {0,0}, {1,0}, {1,0}, {0,1}, {1,0}, {0,1}, {0,1}, {1,1} }, "", true,
-      "반가산기 둘을 잇는다.\n첫째에 A,B → 둘째에 (첫째의 합) 과 올림입력.\n합은 둘째의 합.\n올림은 두 반가산기의 올림을 OR 로." },
+      "반가산기 둘을 잇는다.\n첫째에 A,B → 둘째에 (첫째의 합) 과 올림입력.\n합은 둘째의 합.\n올림은 두 반가산기의 올림을 OR 로.",
+      {}, {}, nullptr, 0, nullptr, 0 },
+
+    // ── 6부. 기억하는 회로 ──
+    { "SR래치", "18. 기억하기",
+      "지금까지는 입력만 보면 답이 정해졌다.\n"
+      "이제 지난 일을 기억하는 회로를 만든다.\n\n"
+      "NOR 둘을 서로 물린다 — 한쪽 출력을 다른 쪽 입력에.\n\n"
+      "셋을 잠깐 켜면 켜진 채로 남고,\n"
+      "리셋을 잠깐 켜면 꺼진 채로 남는다.\n\n"
+      "처음엔 어느 쪽인지 안 정해져서 깜빡일 수 있다.\n"
+      "셋이나 리셋을 한 번 눌러 주면 자리를 잡는다.",
+      2, 1, { "셋", "리셋" }, { "Q" },
+      {}, "NOR", true,
+      "NOR 두 개를 마주 보게 놓는다.\n첫째 NOR: 리셋 과 '둘째 출력'\n둘째 NOR: 셋 과 '첫째 출력'\nQ 는 첫째 NOR 에서 뽑는다.",
+      {}, {}, LAT_SCRIPT, 6, nullptr, 0 },
+
+    { "D래치", "19. 값을 잡아 두기",
+      "셋·리셋을 따로 주는 건 불편하다.\n"
+      "값 하나와 '지금 받아라' 하나면 좋겠다.\n\n"
+      "받아라가 켜져 있을 때만 값이 통하고,\n"
+      "꺼지면 그때 값을 그대로 붙잡게 만든다.\n\n"
+      "SR래치 앞에 AND 둘을 붙이면 된다.",
+      2, 1, { "값", "받아라" }, { "Q" },
+      {}, "SR래치 AND NOT", true,
+      "셋  = 값 그리고 받아라\n리셋 = (값 아님) 그리고 받아라\n이 둘을 SR래치에 넣는다.\n받아라가 꺼지면 둘 다 0 이라 그대로 있는다.",
+      {}, {}, DLAT_SCRIPT, 7, nullptr, 0 },
+
+    { "플립플롭", "20. 순간만 잡기",
+      "D래치는 받아라가 켜져 있는 내내 값이 통한다.\n"
+      "그래서 되먹임 회로에 쓰면 값이 계속 돌아 버린다.\n\n"
+      "필요한 건 '클럭이 올라가는 그 순간' 만 잡는 것이다.\n\n"
+      "D래치 둘을 이어 쓴다. 앞엣것은 클럭이 꺼져 있을 때 받고,\n"
+      "뒤엣것은 켜져 있을 때 받는다. 그러면 넘어가는 값은\n"
+      "올라가기 직전의 값 하나뿐이다.",
+      2, 1, { "값", "클럭" }, { "Q" },
+      {}, "D래치 NOT", true,
+      "D래치 둘을 나란히.\n앞엣것 받아라 = 클럭 아님(NOT)\n뒤엣것 받아라 = 클럭\n앞엣것 Q → 뒤엣것 값\nQ 는 뒤엣것에서 뽑는다.",
+      {}, {}, FF_SCRIPT, 8, nullptr, 0 },
+
+    { "레지스터", "21. 여덟 칸 기억",
+      "플립플롭 하나는 1비트를 기억한다.\n"
+      "여덟 개를 나란히 두면 한 바이트를 기억한다.\n\n"
+      "굵은 선(8비트)을 풀음으로 여덟 가닥으로 풀고,\n"
+      "각각 플립플롭에 넣은 뒤, 묶음으로 다시 묶는다.\n\n"
+      "클럭은 여덟 개 모두에 같이 넣는다.",
+      2, 1, { "값", "클럭" }, { "나온값" },
+      {}, "플립플롭 묶음 풀음", true,
+      "풀음(8비트) 하나, 플립플롭 여덟, 묶음(8비트) 하나.\n클럭 하나를 여덟 군데로 나눠 넣는다.\n한 점에서 선을 여러 번 끌면 된다.",
+      { 8, 1 }, { 8 }, REG_SCRIPT, 8, nullptr, 0 },
+
+    // ── 7부. 계산과 세기 ──
+    { "덧셈기8", "22. 여덟 자리 덧셈",
+      "전가산기 하나는 한 자리를 더한다.\n"
+      "여덟 개를 이어 붙이면 한 바이트를 더한다.\n\n"
+      "아랫자리의 자리올림을 윗자리의 올림입력에 넣는다.\n"
+      "맨 아랫자리의 올림입력은 0,\n"
+      "맨 윗자리에서 나온 올림이 넘침이 된다.",
+      2, 2, { "A", "B" }, { "합", "넘침" },
+      {}, "전가산기 묶음 풀음", true,
+      "풀음 둘로 A 와 B 를 여덟 가닥씩 푼다.\n전가산기 여덟을 세로로 놓고\n앞의 올림을 뒤의 올림입력에 잇는다.\n합 여덟 개는 묶음으로 다시 묶는다.",
+      { 8, 8 }, { 8, 1 }, ADD8_SCRIPT, 6, nullptr, 0 },
+
+    { "세는상자", "23. 세기",
+      "클럭이 올라갈 때마다 1씩 느는 상자다.\n"
+      "다음에 실행할 명령이 어디 있는지 세는 데 쓴다.\n\n"
+      "레지스터에 담긴 값에 1을 더해서\n"
+      "그 결과를 다시 레지스터에 넣으면 된다.\n\n"
+      "되돌리기를 켜면 0 으로 돌아가야 한다.",
+      2, 1, { "클럭", "되돌리기" }, { "값" },
+      {}, "", true,
+      "레지스터 하나, 덧셈기8 하나.\n레지스터 출력 → 덧셈기 A\nB 에는 1 (스위치 하나를 묶음의 0번에)\n덧셈기 합 → 레지스터 값\n되돌리기일 땐 0 이 들어가게 막는다.",
+      { 1, 1 }, { 8 }, CNT_SCRIPT, 11, nullptr, 0 },
+
+    // ── 8부. 계산기 ──
+    { "계산기", "24. 더하고 빼기",
+      "덧셈기로 빼기도 한다.\n\n"
+      "B 를 뒤집고 1 을 더하면 -B 가 된다(2의 보수).\n"
+      "네가 만든 4비트 가감산기와 같은 수법이다.\n\n"
+      "빼기 신호를 B 의 각 비트와 XOR 하고,\n"
+      "그 신호를 맨 아랫자리 올림입력에도 넣으면 된다.",
+      3, 1, { "A", "B", "빼기" }, { "결과" },
+      {}, "덧셈기8 묶음 풀음 XOR", true,
+      "풀음으로 B 를 여덟 가닥 푼다.\n각 가닥을 빼기와 XOR 한다.\n묶음으로 다시 묶어 덧셈기8 의 B 에.\n빼기가 1이면 +1 도 해야 하는데,\n덧셈기8 에 올림입력이 없으니 A 쪽에 1을 더해도 된다.",
+      { 8, 8, 1 }, { 8 }, ALU_SCRIPT, 6, nullptr, 0 },
+
+    { "해독기", "25. 명령 읽기",
+      "명령은 그냥 수다. 0 이면 멈춤, 1 이면 불러오기, 2 면 더하기.\n\n"
+      "그 수를 보고 알맞은 선 하나만 켜 주는 회로가 해독기다.\n\n"
+      "2비트를 풀어서 AND 와 NOT 으로 짝을 맞춘다.\n"
+      "0 = 둘 다 꺼짐, 1 = 아랫자리만, 2 = 윗자리만.",
+      1, 3, { "명령" }, { "멈춤", "불러오기", "더하기" },
+      {}, "풀음 NOT AND", true,
+      "풀음(2비트)으로 명령을 두 가닥으로.\n멈춤   = (아랫자리 아님) 그리고 (윗자리 아님)\n불러오기 = 아랫자리 그리고 (윗자리 아님)\n더하기  = (아랫자리 아님) 그리고 윗자리",
+      { 2 }, {}, DEC_SCRIPT, 4, nullptr, 0 },
+
+    // ── 9부. 컴퓨터 ──
+    { "누산기", "26. 쌓아 두는 곳",
+      "계산한 값을 담아 두는 레지스터를 누산기라고 한다.\n\n"
+      "더할까가 꺼져 있으면 값을 그냥 담고,\n"
+      "켜져 있으면 담긴 값에 더한다.\n\n"
+      "요령은 힌트에 있다.",
+      3, 1, { "클럭", "값", "더할까" }, { "누산기" },
+      {}, "레지스터 계산기 묶음 풀음 AND", true,
+      "계산기 A 에 (누산기값 그리고 더할까) 를 넣는다.\n더할까가 0 이면 A 가 0 이라 0+값 = 값.\n값은 계산기 B 로, 결과는 레지스터로.\n레지스터 출력이 누산기다.",
+      { 1, 8, 1 }, { 8 }, ACC_SCRIPT, 11, nullptr, 0 },
+
+    { "컴퓨터", "27. 스스로 도는 것",
+      "이제 다 모은다. 램의 명령을 스스로 읽어 실행한다.\n\n"
+      "명령 한 바이트 =\n"
+      "  윗 2비트(무엇을) + 아랫 6비트(어떤 수로)\n"
+      "  1 = 넣기,  2 = 더하기,  0 = 멈춤\n\n"
+      "세는상자가 주소를, 램이 명령을 내놓는다.\n\n"
+      "램에는 검사할 때 프로그램이 들어간다.",
+      2, 1, { "클럭", "되돌리기" }, { "누산기" },
+      {}, "", true,
+      "세는상자 → 램 주소 (6비트만 쓰면 된다)\n램 출력을 풀어서 윗 2비트 → 해독기,\n아랫 6비트 → 묶음 → 누산기의 값\n해독기의 '불러오기 또는 더하기' 를 누산기 클럭으로,\n'더하기' 를 누산기의 더할까로.",
+      { 1, 1 }, { 8 }, CPU_SCRIPT, 10, CPU_PROG, 3 },
 };
 
 static const int LESSON_N = (int)(sizeof(LESSONS) / sizeof(LESSONS[0]));
@@ -1115,8 +1563,18 @@ static int findPin(int type, const char* label) {
 }
 
 // 채점. 못 맞추면 어디서 틀렸는지 why 에 적어 준다.
+static int lesInW(const Lesson& L, int i)  { return L.inW[i]  ? L.inW[i]  : 1; }
+static int lesOutW(const Lesson& L, int i) { return L.outW[i] ? L.outW[i] : 1; }
+
+// 출력핀에 들어온 값 (폭이 있으면 수 그대로)
+static Val pinVal(int idx) {
+    if (idx < 0 || idx >= (int)world.comps.size()) return 0;
+    const Comp& c = world.comps[idx];
+    return c.in.empty() ? 0 : c.in[0];
+}
+
 static bool gradeLesson(const Lesson& L, char* why, size_t whyN) {
-    int in[3], out[2];
+    int in[LES_IN_MAX], out[LES_OUT_MAX];
     for (int i = 0; i < L.nIn; ++i) {
         in[i] = findPin(PIN_IN, L.inName[i]);
         if (in[i] < 0) { std::snprintf(why, whyN, "'%s' 이름의 입력핀이 없다", L.inName[i]); return false; }
@@ -1125,6 +1583,59 @@ static bool gradeLesson(const Lesson& L, char* why, size_t whyN) {
         out[i] = findPin(PIN_OUT, L.outName[i]);
         if (out[i] < 0) { std::snprintf(why, whyN, "'%s' 이름의 출력핀이 없다", L.outName[i]); return false; }
     }
+    // 프로그램이 있는 단계는 판에 놓인 램에 미리 넣어 준다 (맨 처음 램 하나)
+    if (L.program && L.nProg > 0) {
+        int ramAt = -1;
+        for (int i = 0; i < (int)world.comps.size(); ++i)
+            if (world.comps[i].alive && world.comps[i].type == RAM) { ramAt = i; break; }
+        if (ramAt < 0) { std::snprintf(why, whyN, "판에 램이 없다"); return false; }
+        Comp& r = world.comps[ramAt];
+        r.mem.assign(RAM_WORDS, 0);
+        for (int i = 0; i < L.nProg && i < RAM_WORDS; ++i)
+            r.mem[i] = maskTo(L.program[i], RAM_DATAW);
+    }
+
+    // ── 값을 차례로 넣어 보는 단계 (기억하는 회로) ──
+    if (L.script && L.nStep > 0) {
+        // 처음 상태를 맞춰 둔다 — 앞 검사에서 남은 값이 섞이면 안 된다
+        for (int i = 0; i < L.nIn; ++i) {
+            auto& o = world.comps[in[i]].out;
+            if (!o.empty()) o[0] = 0;
+        }
+        for (int k = 0; k < 40; ++k) tickSub(world);
+
+        for (int st = 0; st < L.nStep; ++st) {
+            const Step& sp = L.script[st];
+            for (int i = 0; i < L.nIn; ++i) {
+                auto& o = world.comps[in[i]].out;
+                if (!o.empty()) o[0] = maskTo(sp.in[i], lesInW(L, i));
+            }
+            int tk = sp.ticks ? sp.ticks : 120;   // 여덟 자리 이어지는 데 시간이 걸린다
+            for (int k = 0; k < tk; ++k) tickSub(world);
+
+            for (int i = 0; i < L.nOut; ++i) {
+                if (!(sp.check & (1u << i))) continue;
+                Val got  = maskTo(pinVal(out[i]), lesOutW(L, i));
+                Val want = maskTo(sp.want[i], lesOutW(L, i));
+                if (got != want) {
+                    char inbuf[96] = "";
+                    for (int j = 0; j < L.nIn; ++j) {
+                        char one[28];
+                        std::snprintf(one, sizeof(one), "%s%s=%d", j ? ", " : "",
+                                      L.inName[j], (int)maskTo(sp.in[j], lesInW(L, j)));
+                        std::strncat(inbuf, one, sizeof(inbuf) - std::strlen(inbuf) - 1);
+                    }
+                    std::snprintf(why, whyN, "%d번째: %s 일 때 %s 가 %d (%d 이어야 함)%s%s",
+                                  st + 1, inbuf, L.outName[i], (int)got, (int)want,
+                                  sp.note ? " — " : "", sp.note ? sp.note : "");
+                    return false;
+                }
+            }
+        }
+        std::snprintf(why, whyN, "통과");
+        return true;
+    }
+
     int cases = 1 << L.nIn;
     for (int t = 0; t < cases; ++t) {
         for (int i = 0; i < L.nIn; ++i) {
@@ -1159,10 +1670,14 @@ static void setupLesson(int at) {
     for (int i = 0; i < L.nIn; ++i) {
         int c = addComp(world, PIN_IN, 90, 120 + i * 110);
         world.comps[c].label = L.inName[i];
+        world.comps[c].aux = lesInW(L, i);
+        resizePorts(world.comps[c]);
     }
     for (int i = 0; i < L.nOut; ++i) {
-        int c = addComp(world, PIN_OUT, 500, 150 + i * 110);
+        int c = addComp(world, PIN_OUT, 560, 150 + i * 110);
         world.comps[c].label = L.outName[i];
+        world.comps[c].aux = lesOutW(L, i);
+        resizePorts(world.comps[c]);
     }
     viewZoom = 1.0f; viewX = 0; viewY = 0;
 }
@@ -1542,10 +2057,51 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
         frameRect(ren, { box.x+1, box.y+1, box.w-2, box.h-2 }, shade(base, on ? 60 : 10));
         drawTextC(ren, cx, box.y + box.h/2 - ts*3/5, ts,
                   on ? 0x0E140F : COL_TEXT, compName(c));
-        if (viewZoom > 0.55f)
+        if (viewZoom > 0.55f) {
+            char sub[32];
+            int wd = widthOf(c);
+            if (wd > 1) std::snprintf(sub, sizeof(sub), "%d비트  %d", wd, (int)shownVal(c));
+            else        std::snprintf(sub, sizeof(sub), "%s", c.type == PIN_IN ? "입력핀" : "출력핀");
             drawTextC(ren, cx, box.y + box.h - w2sLen(15), std::max(7, (int)(10 * viewZoom)),
-                      on ? 0x0E140F : shade(base, 70),
-                      c.type == PIN_IN ? "입력핀" : "출력핀");
+                      on ? 0x0E140F : shade(base, 70), sub);
+        }
+    } else if (c.type == CLOCK) {
+        uint32_t col = on ? blend(base, 0xFFE0A0, 120) : shade(base, -34);
+        fillRect(ren, box, col);
+        frameRect(ren, box, on ? 0xFFE0A0 : shade(base, 40));
+        // 켜짐/꺼짐은 글자 대신 네모를 그린다 (글꼴에 없는 기호를 쓰면 두부가 나온다)
+        {
+            int sq = std::max(4, w2sLen(14));
+            Rect m{ cx - sq/2, box.y + box.h/2 - sq/2 - w2sLen(4), sq, sq };
+            if (on) fillRect(ren, m, 0x201804);
+            else    frameRect(ren, m, COL_TEXT);
+        }
+        if (viewZoom > 0.55f) {
+            char b2[24];
+            std::snprintf(b2, sizeof(b2), "%d틱", CLOCK_TICKS[std::clamp(c.aux, 0, CLOCK_N-1)]);
+            drawTextC(ren, cx, box.y + box.h - w2sLen(15), std::max(7, (int)(10 * viewZoom)),
+                      on ? 0x201804 : shade(base, 70), b2);
+        }
+    } else if (c.type == RAM) {
+        fillRect(ren, box, shade(base, -14));
+        frameRect(ren, box, shade(base, 45));
+        drawTextC(ren, cx, box.y + box.h/2 - ts, ts, COL_TEXT, "램");
+        if (viewZoom > 0.5f) {
+            char b2[32];
+            Val addr = c.in.empty() ? 0 : c.in[0];
+            std::snprintf(b2, sizeof(b2), "%d→%d", (int)addr, (int)(c.out.empty()?0:c.out[0]));
+            drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
+                      0xE0C0E8, b2);
+        }
+    } else if (c.type == BUNDLE || c.type == SPLIT) {
+        fillRect(ren, box, shade(base, -14));
+        frameRect(ren, box, shade(base, 45));
+        drawTextC(ren, cx, box.y + box.h/2 - ts, ts, COL_TEXT, compName(c));
+        if (viewZoom > 0.5f) {
+            char b2[24]; std::snprintf(b2, sizeof(b2), "%d비트", widthOf(c));
+            drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
+                      0xA0D0D0, b2);
+        }
     } else if (c.type == SWITCH || c.type == LAMP) {
         uint32_t col = on ? blend(base, COL_ON, 150) : shade(base, -30);
         fillRect(ren, box, col);
@@ -1590,9 +2146,11 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
 static void drawWire(SDL_Renderer* ren, const Wire& w) {
     const Comp& a = world.comps[w.from];
     int pts[24][2]; wireCurve(w, pts, 24);
-    bool on = w.fromPort < (int)a.out.size() && a.out[w.fromPort];
-    uint32_t col = on ? COL_ON : COL_OFF;
-    int th = std::max(1, w2sLen(on ? 4 : 3));
+    bool on = w.fromPort < (int)a.out.size() && a.out[w.fromPort] != 0;
+    int wd = (w.fromPort < (int)a.outW.size()) ? a.outW[w.fromPort] : 1;
+    uint32_t col = (wd > 1) ? (on ? 0x6AC8E0 : 0x3A4A54)      // 굵은 선은 파랑끼
+                            : (on ? COL_ON : COL_OFF);
+    int th = std::max(1, w2sLen(wd > 1 ? (on ? 7 : 6) : (on ? 4 : 3)));
     for (int k = 0; k < 23; ++k)
         thickLine(ren, w2sX((float)pts[k][0]),   w2sY((float)pts[k][1]),
                        w2sX((float)pts[k+1][0]), w2sY((float)pts[k+1][1]), th, col);
@@ -1603,10 +2161,15 @@ static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool) 
     fillRect(ren, { PANEL_W - 1, 0, 1, WIN_H }, COL_LINE);
     drawText(ren, S(14), S(12), 18, COL_TEXT, "셈틀");
 
+    clampToolScroll();
     int nt = toolCount();
+    // 목록 자리 밖으로 나간 줄은 안 그린다
+    SDL_Rect listClip{ 0, toolTop() - S(4), PANEL_W, toolBot() - toolTop() + S(8) };
+    SDL_RenderSetClipRect(ren, &listClip);
     for (int i = 0; i < nt; ++i) {
         Rect r = toolRect(i);
-        if (r.y + r.h > btnBundle().y - 6) break;      // 자리 넘으면 그만 (v1)
+        if (r.y + r.h < toolTop() - S(8)) continue;
+        if (r.y > toolBot() + S(8)) break;
         bool on = (i == tool);
         bool can = toolEnabled(i);
         fillRect(ren, r, on ? 0x2E3550 : (can ? 0x232733 : 0x1C1F27));
@@ -1707,6 +2270,9 @@ static void drawMenu(SDL_Renderer* ren, int hover) {
 // ─────────────────────────────────────────────────────────────
 
 // 모드마다 저장본이 따로다. 문제 풀다 샌드박스에 가도 내 회로가 그대로 있다.
+// 저장 형식 번호. 1 = 예전(이름이 '논리'이던 시절 포함), 2 = 폭·클럭·램이 생긴 뒤.
+static const int SAVE_VER = 2;
+
 static std::string savePathFor(int sc) {
     const char* over = env2("SEMTLE_SAVE", "LOGIC_SAVE");   // 검사에서 딴 데를 쓰게
     if (over) return sc == SC_LEARN ? std::string(over) + ".learn" : std::string(over);
@@ -1720,25 +2286,29 @@ static std::string savePath() { return savePathFor(screen == SC_MENU ? SC_SANDBO
 // 부품 하나를 알맞은 크기의 빈 상태로 만든다
 static Comp blankComp(int type, int chipId) {
     Comp c; c.type = type; c.chipId = chipId;
-    int ni, no;
-    if (chipId >= 0) {
-        c.sub = std::make_shared<SubSim>(deepCopy(chips[chipId].tmpl));
-        ni = (int)chips[chipId].tmpl.inPorts.size();
-        no = (int)chips[chipId].tmpl.outPorts.size();
-    } else {
-        ni = TYPES[type].nIn;
-        no = TYPES[type].hasOut ? 1 : 0;
-    }
-    c.in.assign(ni, 0); c.out.assign(no, 0); c.nextOut.assign(no, 0);
+    if (chipId >= 0) c.sub = std::make_shared<SubSim>(deepCopy(chips[chipId].tmpl));
+    resizePorts(c);
     return c;
 }
 
 static void writeSub(std::FILE* f, const SubSim& s) {
     std::fprintf(f, "부품 %d\n", (int)s.comps.size());
     for (const auto& c : s.comps)
-        // 이름은 빈칸이 들어갈 수 있으니 줄 맨 끝에 둔다
-        std::fprintf(f, "%d %d %d %d %d %d %d %s\n", c.type, c.chipId, c.x, c.y, c.rot,
-                     (int)c.alive, (int)(!c.out.empty() && c.out[0]), c.label.c_str());
+        // aux(폭·클럭주기) 가 늘었다. 이름은 빈칸이 들어갈 수 있으니 줄 맨 끝.
+        std::fprintf(f, "%d %d %d %d %d %d %d %d %s\n", c.type, c.chipId, c.x, c.y, c.rot,
+                     (int)c.alive, (int)(c.out.empty() ? 0 : c.out[0]), c.aux, c.label.c_str());
+    // 램 속은 따로 (0 이 아닌 자리만)
+    for (int i = 0; i < (int)s.comps.size(); ++i) {
+        const Comp& c = s.comps[i];
+        if (c.type != RAM || c.mem.empty()) continue;
+        int used = 0;
+        for (Val v : c.mem) if (v) ++used;
+        std::fprintf(f, "램속 %d %d", i, used);
+        for (int k = 0; k < (int)c.mem.size(); ++k)
+            if (c.mem[k]) std::fprintf(f, " %d %d", k, (int)c.mem[k]);
+        std::fprintf(f, "\n");
+    }
+    std::fprintf(f, "램끝\n");
     std::fprintf(f, "선 %d\n", (int)s.wires.size());
     for (const auto& w : s.wires)
         std::fprintf(f, "%d %d %d %d %d\n", w.from, w.fromPort, w.to, w.toPort, (int)w.alive);
@@ -1749,14 +2319,18 @@ static void writeSub(std::FILE* f, const SubSim& s) {
     std::fprintf(f, "\n");
 }
 
+static int fileVer = SAVE_VER;      // 지금 읽는 중인 파일의 형식 번호
+
 static bool readSub(std::FILE* f, SubSim& s) {
     int n = 0;
     if (std::fscanf(f, " 부품 %d", &n) != 1 || n < 0 || n > 100000) return false;
     s.comps.clear();
     for (int i = 0; i < n; ++i) {
-        int type, chipId, x, y, rot, alive, sw;
+        int type, chipId, x, y, rot, alive, sw, aux = 0;
         if (std::fscanf(f, " %d %d %d %d %d %d %d",
                         &type, &chipId, &x, &y, &rot, &alive, &sw) != 7) return false;
+        // aux 는 형식 2부터 있다. 예전 파일에는 아예 없다.
+        if (fileVer >= 2 && std::fscanf(f, " %d", &aux) != 1) return false;
         // 표에 없는 번호가 들어오면 파일이 깨진 것이다
         if (chipId >= (int)chips.size()) return false;
         if (chipId < 0 && (type < 0 || type >= TYPE_N)) return false;
@@ -1771,9 +2345,30 @@ static bool readSub(std::FILE* f, SubSim& s) {
         Comp c = blankComp(type, chipId);
         c.x = x; c.y = y; c.rot = rot & 3; c.alive = alive != 0;
         c.label = lab;
-        if (sw && !c.out.empty()) c.out[0] = 1;
+        if (chipId < 0 && hasWidth(type)) { c.aux = std::clamp(aux, 1, WIDTH_MAX); resizePorts(c); }
+        else if (chipId < 0 && type == CLOCK) c.aux = std::clamp(aux, 0, CLOCK_N - 1);
+        if (sw && !c.out.empty()) c.out[0] = maskTo((Val)sw, c.outW.empty() ? 1 : c.outW[0]);
         s.comps.push_back(std::move(c));
     }
+    // 램 속 (형식 2부터)
+    if (fileVer >= 2) { long pos = std::ftell(f);
+      char tag[32] = "";
+      while (std::fscanf(f, " %31s", tag) == 1 && std::strcmp(tag, "램속") == 0) {
+          int idx = 0, used = 0;
+          if (std::fscanf(f, " %d %d", &idx, &used) != 2 || used < 0 || used > RAM_WORDS) return false;
+          for (int k = 0; k < used; ++k) {
+              int at = 0, v = 0;
+              if (std::fscanf(f, " %d %d", &at, &v) != 2) return false;
+              if (idx >= 0 && idx < (int)s.comps.size() && s.comps[idx].type == RAM) {
+                  if (s.comps[idx].mem.size() != (size_t)RAM_WORDS) s.comps[idx].mem.assign(RAM_WORDS, 0);
+                  if (at >= 0 && at < RAM_WORDS) s.comps[idx].mem[at] = maskTo((Val)v, RAM_DATAW);
+              }
+          }
+          pos = std::ftell(f);
+      }
+      if (std::strcmp(tag, "램끝") != 0) std::fseek(f, pos, SEEK_SET);   // 예전 파일
+    }
+
     if (std::fscanf(f, " 선 %d", &n) != 1 || n < 0 || n > 400000) return false;
     s.wires.clear();
     for (int i = 0; i < n; ++i) {
@@ -1811,7 +2406,7 @@ static bool saveTo(const std::string& path) {
     std::FILE* f = std::fopen(tmp.c_str(), "w");
     if (!f) return false;
 
-    std::fprintf(f, "셈틀 1\n");
+    std::fprintf(f, "셈틀 %d\n", SAVE_VER);
     std::fprintf(f, "칩 %d\n", (int)chips.size());
     for (const auto& ch : chips) {
         std::fprintf(f, "칩시작 %u %d %s\n", ch.color, (int)ch.alive, ch.name.c_str());
@@ -1898,7 +2493,9 @@ static bool loadFrom(const std::string& path) {
         // 이름을 바꾸기 전 파일은 머리말이 "논리" 다. 둘 다 받아 준다.
         char head[32] = "";
         if (std::fscanf(f, " %31s %d", head, &ver) != 2) break;
-        if ((std::strcmp(head, "셈틀") != 0 && std::strcmp(head, "논리") != 0) || ver != 1) break;
+        if (std::strcmp(head, "셈틀") != 0 && std::strcmp(head, "논리") != 0) break;
+        if (ver < 1 || ver > SAVE_VER) break;
+        fileVer = ver;
         if (std::fscanf(f, " 칩 %d", &n) != 1 || n < 0 || n > 5000) break;
         bool bad = false;
         for (int i = 0; i < n && !bad; ++i) {
@@ -2781,6 +3378,7 @@ static int runTests() {
             int C  = L.nIn > 2 ? findPin(PIN_IN, L.inName[2]) : -1;
             int O0 = findPin(PIN_OUT, L.outName[0]);
             int O1 = L.nOut > 1 ? findPin(PIN_OUT, L.outName[1]) : -1;
+            int O2 = L.nOut > 2 ? findPin(PIN_OUT, L.outName[2]) : -1;
 
             // 붙박이 게이트 하나로 끝나는 단계는 표를 보고 알아서 고른다
             auto plain = [&](int type) {
@@ -2859,6 +3457,200 @@ static int runTests() {
                 addWire(world, A, 0, x, 0); addWire(world, B, 0, x, 1);
                 addWire(world, A, 0, n, 0); addWire(world, B, 0, n, 1);
                 addWire(world, x, 0, O0, 0); addWire(world, n, 0, O1, 0);
+            }
+            else if (t.find("기억하기") != std::string::npos) {       // SR 래치
+                // Q = NOR(리셋, Q아님),  Q아님 = NOR(셋, Q)
+                int n1 = addComp(world, T_NOR, 300, 120);            // Q 쪽
+                int n2 = addComp(world, T_NOR, 300, 300);            // Q아님 쪽
+                addWire(world, B, 0, n1, 0);                          // 리셋
+                addWire(world, n2, 0, n1, 1);
+                addWire(world, A, 0, n2, 0);                          // 셋
+                addWire(world, n1, 0, n2, 1);
+                addWire(world, n1, 0, O0, 0);
+            }
+            else if (t.find("잡아 두기") != std::string::npos) {       // D 래치
+                int li = chipNamed("SR래치");
+                if (li < 0) { std::snprintf(detail, sizeof(detail), "%d단계: SR래치 칩이 없다", at+1); broke = true; break; }
+                int nt2 = addComp(world, T_NOT, 240, 300);
+                int as  = addComp(world, T_AND, 360, 130);            // 셋  = 값 & 받아라
+                int ar  = addComp(world, T_AND, 360, 300);            // 리셋 = ~값 & 받아라
+                int lat = addChip(world, li, 500, 200);
+                addWire(world, A, 0, as, 0); addWire(world, B, 0, as, 1);
+                addWire(world, A, 0, nt2, 0);
+                addWire(world, nt2, 0, ar, 0); addWire(world, B, 0, ar, 1);
+                addWire(world, as, 0, lat, 0); addWire(world, ar, 0, lat, 1);
+                addWire(world, lat, 0, O0, 0);
+            }
+            else if (t.find("순간만 잡기") != std::string::npos) {     // 엣지 플립플롭
+                int di = chipNamed("D래치");
+                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: D래치 칩이 없다", at+1); broke = true; break; }
+                int nc = addComp(world, T_NOT, 240, 320);
+                int m  = addChip(world, di, 380, 140);      // 앞엣것 (클럭 꺼졌을 때 받음)
+                int sl = addChip(world, di, 560, 220);      // 뒤엣것 (켜졌을 때 받음)
+                addWire(world, B, 0, nc, 0);
+                addWire(world, A, 0, m, 0); addWire(world, nc, 0, m, 1);
+                addWire(world, m, 0, sl, 0); addWire(world, B, 0, sl, 1);
+                addWire(world, sl, 0, O0, 0);
+            }
+            else if (t.find("여덟 칸") != std::string::npos) {         // 8비트 레지스터
+                int di = chipNamed("플립플롭");
+                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 플립플롭 칩이 없다", at+1); broke = true; break; }
+                int sp = addComp(world, SPLIT, 220, 200);
+                int bu = addComp(world, BUNDLE, 700, 200);
+                addWire(world, A, 0, sp, 0);                          // 값(8비트)
+                for (int k = 0; k < 8; ++k) {
+                    int d = addChip(world, di, 420, 40 + k * 70);
+                    addWire(world, sp, k, d, 0);                      // 그 비트
+                    addWire(world, B, 0, d, 1);                       // 받아라 (여덟 군데로)
+                    addWire(world, d, 0, bu, k);
+                }
+                addWire(world, bu, 0, O0, 0);
+            }
+            else if (t.find("여덟 자리 덧셈") != std::string::npos) {  // 8비트 덧셈기
+                int fi = chipNamed("전가산기");
+                if (fi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 전가산기 칩이 없다", at+1); broke = true; break; }
+                int spA = addComp(world, SPLIT, 200, 120);
+                int spB = addComp(world, SPLIT, 200, 360);
+                int bu  = addComp(world, BUNDLE, 800, 200);
+                addWire(world, A, 0, spA, 0);
+                addWire(world, B, 0, spB, 0);
+                int carry = -1;                       // 앞자리에서 넘어온 올림
+                for (int k = 0; k < 8; ++k) {
+                    int fa = addChip(world, fi, 480, 20 + k * 90);
+                    addWire(world, spA, k, fa, 0);
+                    addWire(world, spB, k, fa, 1);
+                    if (carry >= 0) addWire(world, carry, 1, fa, 2);   // 앞의 올림 → 올림입력
+                    addWire(world, fa, 0, bu, k);                      // 합
+                    carry = fa;
+                }
+                addWire(world, bu, 0, O0, 0);
+                if (carry >= 0) addWire(world, carry, 1, O1, 0);       // 맨 위 올림 = 넘침
+            }
+            else if (t.find("23. 세기") != std::string::npos) {         // 세는 상자
+                int ri = chipNamed("레지스터"), ai = chipNamed("덧셈기8");
+                if (ri < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
+                int reg = addChip(world, ri, 620, 200);
+                int add = addChip(world, ai, 380, 320);
+                int one = addComp(world, BUNDLE, 200, 420);            // 1 을 만든다
+                int sw1 = addComp(world, SWITCH, 60, 420);
+                setSwitch(sw1, 1);
+                addWire(world, sw1, 0, one, 0);                        // 0번 자리만 켜면 1
+                // 되돌리기면 0 이 들어가게 — 여덟 비트를 각각 AND 로 막는다
+                int nr = addComp(world, T_NOT, 200, 560);
+                addWire(world, B, 0, nr, 0);                           // 되돌리기 아님
+                int spS = addComp(world, SPLIT, 500, 520);
+                int buG = addComp(world, BUNDLE, 700, 520);
+                addWire(world, add, 0, spS, 0);                        // 더한 값을 풀고
+                for (int k = 0; k < 8; ++k) {
+                    int g = addComp(world, T_AND, 600, 500 + k * 60);
+                    addWire(world, spS, k, g, 0);
+                    addWire(world, nr, 0, g, 1);                       // 되돌리기면 0
+                    addWire(world, g, 0, buG, k);
+                }
+                addWire(world, buG, 0, reg, 0);                        // 레지스터로
+                addWire(world, A, 0, reg, 1);                          // 클럭 = 받아라
+                addWire(world, reg, 0, add, 0);                        // 되먹임
+                addWire(world, one, 0, add, 1);
+                addWire(world, reg, 0, O0, 0);
+            }
+            else if (t.find("더하고 빼기") != std::string::npos) {     // 계산기
+                int ai = chipNamed("덧셈기8");
+                if (ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 덧셈기8 칩이 없다", at+1); broke = true; break; }
+                // B 를 빼기와 XOR 해서 뒤집고, A 쪽에 빼기(=1)를 더해 2의 보수를 맞춘다
+                int spB = addComp(world, SPLIT, 220, 300);
+                int buB = addComp(world, BUNDLE, 460, 300);
+                addWire(world, B, 0, spB, 0);
+                for (int k = 0; k < 8; ++k) {
+                    int x = addComp(world, T_XOR, 340, 220 + k * 60);
+                    addWire(world, spB, k, x, 0);
+                    addWire(world, C, 0, x, 1);            // 빼기
+                    addWire(world, x, 0, buB, k);
+                }
+                int buOne = addComp(world, BUNDLE, 300, 60);   // 빼기면 1
+                addWire(world, C, 0, buOne, 0);
+                int add1 = addChip(world, ai, 520, 60);        // A + (빼기?1:0)
+                addWire(world, A, 0, add1, 0);
+                addWire(world, buOne, 0, add1, 1);
+                int add2 = addChip(world, ai, 720, 200);       // 그 결과 + 뒤집은 B
+                addWire(world, add1, 0, add2, 0);
+                addWire(world, buB, 0, add2, 1);
+                addWire(world, add2, 0, O0, 0);
+            }
+            else if (t.find("명령 읽기") != std::string::npos) {       // 해독기
+                int sp = addComp(world, SPLIT, 240, 200);
+                world.comps[sp].aux = 2; resizePorts(world.comps[sp]);
+                addWire(world, A, 0, sp, 0);
+                int n0 = addComp(world, T_NOT, 380, 120);      // 아랫자리 아님
+                int n1 = addComp(world, T_NOT, 380, 300);      // 윗자리 아님
+                addWire(world, sp, 0, n0, 0);
+                addWire(world, sp, 1, n1, 0);
+                int g0 = addComp(world, T_AND, 540, 100);      // 멈춤
+                addWire(world, n0, 0, g0, 0); addWire(world, n1, 0, g0, 1);
+                int g1 = addComp(world, T_AND, 540, 220);      // 불러오기
+                addWire(world, sp, 0, g1, 0); addWire(world, n1, 0, g1, 1);
+                int g2 = addComp(world, T_AND, 540, 340);      // 더하기
+                addWire(world, n0, 0, g2, 0); addWire(world, sp, 1, g2, 1);
+                addWire(world, g0, 0, O0, 0);
+                addWire(world, g1, 0, O1, 0);
+                addWire(world, g2, 0, O2, 0);
+            }
+            else if (t.find("쌓아 두는 곳") != std::string::npos) {    // 누산기
+                int ri = chipNamed("레지스터"), ci = chipNamed("계산기");
+                if (ri < 0 || ci < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
+                int reg = addChip(world, ri, 760, 200);
+                int alu = addChip(world, ci, 560, 300);
+                int sp  = addComp(world, SPLIT, 220, 420);
+                int bu  = addComp(world, BUNDLE, 440, 420);
+                addWire(world, reg, 0, sp, 0);                 // 누산기값을 풀어서
+                for (int k = 0; k < 8; ++k) {
+                    int g = addComp(world, T_AND, 330, 380 + k * 55);
+                    addWire(world, sp, k, g, 0);
+                    addWire(world, C, 0, g, 1);                // 더할까
+                    addWire(world, g, 0, bu, k);
+                }
+                addWire(world, bu, 0, alu, 0);                 // 계산기 A
+                addWire(world, B, 0, alu, 1);                  // 계산기 B = 값
+                addWire(world, alu, 0, reg, 0);
+                addWire(world, A, 0, reg, 1);                  // 클럭
+                addWire(world, reg, 0, O0, 0);
+            }
+            else if (t.find("스스로 도는 것") != std::string::npos) {   // 컴퓨터
+                int ci = chipNamed("세는상자"), di = chipNamed("해독기"), ai = chipNamed("누산기");
+                if (ci < 0 || di < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
+                int pc  = addChip(world, ci, 180, 200);
+                int ram = addComp(world, RAM, 380, 200);
+                int sp  = addComp(world, SPLIT, 560, 200);     // 명령 바이트를 여덟 가닥으로
+                int dec = addChip(world, di, 760, 120);
+                int acc = addChip(world, ai, 900, 300);
+
+                addWire(world, A, 0, pc, 0);                   // 클럭
+                addWire(world, B, 0, pc, 1);                   // 되돌리기
+                addWire(world, pc, 0, ram, 0);                 // 세는 값 → 주소
+                addWire(world, ram, 0, sp, 0);                 // 명령 바이트
+
+                int opBu = addComp(world, BUNDLE, 660, 60);    // 윗 2비트 → 해독기
+                opBu = opBu;
+                world.comps[opBu].aux = 2; resizePorts(world.comps[opBu]);
+                addWire(world, sp, 6, opBu, 0);
+                addWire(world, sp, 7, opBu, 1);
+                addWire(world, opBu, 0, dec, 0);
+
+                int valBu = addComp(world, BUNDLE, 660, 420);  // 아랫 6비트 → 누산기 값
+                for (int k = 0; k < 6; ++k) addWire(world, sp, k, valBu, k);
+
+                // 넣기나 더하기일 때만 누산기가 받는다
+                int orLd = addComp(world, T_OR, 860, 180);
+                addWire(world, dec, 1, orLd, 0);               // 불러오기
+                addWire(world, dec, 2, orLd, 1);               // 더하기
+                // 클럭이 올라갈 때만 실제로 받게 클럭과 AND
+                int gate = addComp(world, T_AND, 880, 240);
+                addWire(world, orLd, 0, gate, 0);
+                addWire(world, A, 0, gate, 1);
+
+                addWire(world, gate, 0, acc, 0);               // 누산기 클럭
+                addWire(world, valBu, 0, acc, 1);              // 값
+                addWire(world, dec, 2, acc, 2);                // 더할까
+                addWire(world, acc, 0, O0, 0);
             }
             else {                                                   // 전가산기
                 int hi = chipNamed("반가산기");
@@ -3047,19 +3839,33 @@ static int runTests() {
             createChip({ p2, q2 }, n);
         }
         int nt = toolCount();
+        // 끝까지 굴리면 마지막 줄이 자리 안에 들어와야 한다
+        toolScroll = toolScrollMax();
         Rect last = toolRect(nt - 1);
-        int limit = (WIN_H - S(84)) - S(6);         // 아래 단추들 위
-        if (last.y + last.h > limit || toolPitch() < S(21)) {
+        if (last.y + last.h > toolBot() + S(2)) {
             everFail = true;
-            std::snprintf(why2, sizeof(why2), "배율 %.1f (%dx%d) 에서 마지막 줄 %d > %d",
-                          us, WIN_W, WIN_H, last.y + last.h, limit);
+            std::snprintf(why2, sizeof(why2), "배율 %.1f (%dx%d): 끝까지 굴려도 마지막 줄 %d > %d",
+                          us, WIN_W, WIN_H, last.y + last.h, toolBot());
+        }
+        // 맨 위로 굴리면 첫 줄이 보여야 한다
+        toolScroll = 0;
+        if (toolRect(0).y < toolTop() - S(2)) {
+            everFail = true;
+            std::snprintf(why2, sizeof(why2), "배율 %.1f: 맨 위로 굴려도 첫 줄이 안 보임", us);
+        }
+        // 굴림 값이 한도를 안 넘는다
+        toolScroll = 99999; clampToolScroll();
+        if (toolScroll != toolScrollMax()) {
+            everFail = true;
+            std::snprintf(why2, sizeof(why2), "배율 %.1f: 굴림 한도가 안 먹음", us);
         }
         if (us > 2.0f)
-            std::snprintf(buf, sizeof(buf), "배율 0.8~2.2 에서 도구 %d개 다 보임 (2.2배 줄높이 %d)",
-                          nt, toolPitch());
+            std::snprintf(buf, sizeof(buf), "배율 0.8~2.2 에서 도구 %d개, 2.2배 줄높이 %d·굴릴 거리 %dpx",
+                          nt, toolPitch(), toolScrollMax());
+        toolScroll = 0;
         }
         uiScale = ous; applyUiScale();
-        check("칩이 많아도 목록이 다 보인다", !everFail, everFail ? why2 : buf);
+        check("칩이 많아도 목록에 다 닿는다", !everFail, everFail ? why2 : buf);
         WIN_W = ow; WIN_H = oh; world = SubSim{}; chips.clear();
     }
 
@@ -3400,6 +4206,278 @@ static int runTests() {
         editStack.clear();
     }
 
+    // 44. 묶음·풀음이 가는 선과 굵은 선을 오간다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        int bu = addComp(world, BUNDLE, 200, 100);   // 기본 8비트
+        int sp = addComp(world, SPLIT, 500, 100);
+        bool w8 = (widthOf(world.comps[bu]) == 8) && (nIn(world.comps[bu]) == 8)
+                  && (nOut(world.comps[sp]) == 8);
+        // 굵은 선끼리 잇는다
+        addWire(world, bu, 0, sp, 0);
+        int joined = 0; for (auto& w : world.wires) if (w.alive) ++joined;
+
+        // 스위치 여덟으로 0b10110101 = 181 을 만든다
+        int want = 181;
+        std::vector<int> sw;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, SWITCH, 20, 40 + i * 40);
+            sw.push_back(q);
+            addWire(world, q, 0, bu, i);
+            setSwitch(q, (want >> i) & 1);
+        }
+        // 풀음 뒤에 전구 여덟
+        std::vector<int> lp;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, LAMP, 700, 40 + i * 40);
+            lp.push_back(q);
+            addWire(world, sp, i, q, 0);
+        }
+        settle();
+        int got = 0;
+        for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) got |= (1 << i);
+        Val onWire = world.comps[bu].out.empty() ? 0 : world.comps[bu].out[0];
+
+        std::snprintf(buf, sizeof(buf), "폭 8 %d, 굵은 선 %d개, 넣은 값 %d → 선에 %d → 나온 값 %d",
+                      (int)w8, joined, want, (int)onWire, got);
+        check("묶음·풀음이 값을 실어 나른다", w8 && joined == 1 && onWire == want && got == want, buf);
+    }
+
+    // 45. 폭이 다르면 안 이어진다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int sw = addComp(world, SWITCH, 20, 20);          // 1비트
+        int bu = addComp(world, BUNDLE, 200, 20);         // 8비트 출력
+        int lp = addComp(world, LAMP, 400, 20);           // 1비트 입력
+        addWire(world, bu, 0, lp, 0);                     // 8비트 → 1비트, 막혀야 한다
+        int bad = 0; for (auto& w : world.wires) if (w.alive) ++bad;
+        addWire(world, sw, 0, bu, 0);                     // 1비트 → 1비트, 되어야 한다
+        int good = 0; for (auto& w : world.wires) if (w.alive) ++good;
+        std::snprintf(buf, sizeof(buf), "폭 다른 것 이은 선 %d개(0이어야), 맞는 것 %d개", bad, good);
+        check("폭이 다르면 안 이어진다", bad == 0 && good == 1, buf);
+    }
+
+    // 46. 클럭이 제 박자로 뒤집힌다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int ck = addComp(world, CLOCK, 100, 100);
+        world.comps[ck].aux = 2;                          // CLOCK_TICKS[2] = 4틱
+        int per = CLOCK_TICKS[2];
+        // 240틱 도는 동안 몇 번 뒤집히나 — 주기의 두 배마다 한 바퀴
+        int flips = 0; bool last = lit(world.comps[ck]);
+        for (int i = 0; i < 240; ++i) {
+            tickSub(world);
+            bool now = lit(world.comps[ck]);
+            if (now != last) { ++flips; last = now; }
+        }
+        int wantFlips = 240 / per;
+        bool ok = std::abs(flips - wantFlips) <= 1;
+        // 빠르기를 바꾸면 뒤집는 횟수도 바뀐다
+        world = SubSim{};
+        int ck2 = addComp(world, CLOCK, 100, 100);
+        world.comps[ck2].aux = 0;                         // 1틱마다
+        int fast = 0; last = lit(world.comps[ck2]);
+        for (int i = 0; i < 240; ++i) {
+            tickSub(world);
+            bool now = lit(world.comps[ck2]);
+            if (now != last) { ++fast; last = now; }
+        }
+        std::snprintf(buf, sizeof(buf), "%d틱 주기로 240틱에 %d번(바라는 값 %d), 1틱 주기면 %d번",
+                      per, flips, wantFlips, fast);
+        check("클럭이 제 박자로 뒤집힌다", ok && fast > flips * 2, buf);
+    }
+
+    // 47. 램이 쓰고 읽는다 (클럭이 올라갈 때만 쓴다)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int ram = addComp(world, RAM, 300, 100);
+        bool ports = nIn(world.comps[ram]) == 4 && nOut(world.comps[ram]) == 1
+                     && inWidth(world.comps[ram], 0) == RAM_ADDRW
+                     && outWidth(world.comps[ram], 0) == RAM_DATAW;
+
+        // 주소·데이터·쓰기·클럭을 손으로 넣어 준다
+        auto poke = [&](int addr, int data, int we, int clk) {
+            Comp& c = world.comps[ram];
+            c.in.assign(4, 0);
+            c.in[0] = (Val)addr; c.in[1] = (Val)data; c.in[2] = (Val)we; c.in[3] = (Val)clk;
+            // tickSub 이 in 을 지우므로 램 계산만 흉내 낸다
+            if (c.mem.size() != (size_t)RAM_WORDS) c.mem.assign(RAM_WORDS, 0);
+            if (we && clk && !c.lastClk) c.mem[addr % RAM_WORDS] = maskTo((Val)data, RAM_DATAW);
+            c.lastClk = clk ? 1 : 0;
+            c.out.assign(1, c.mem[addr % RAM_WORDS]);
+            return (int)c.out[0];
+        };
+        poke(7, 200, 1, 0);                 // 쓰기는 켰지만 클럭이 아직 0
+        int beforeEdge = poke(7, 200, 1, 0);
+        int atEdge     = poke(7, 200, 1, 1);   // 여기서 써진다
+        poke(7, 99, 0, 0);                     // 쓰기 끄고
+        int keptAfter  = poke(7, 99, 0, 1);    // 클럭이 올라가도 안 써져야
+        int other      = poke(8, 0, 0, 0);     // 딴 자리는 0
+
+        std::snprintf(buf, sizeof(buf), "포트 %d, 쓰기 전 %d, 클럭 올라갈 때 %d, 쓰기 끄면 %d, 딴 자리 %d",
+                      (int)ports, beforeEdge, atEdge, keptAfter, other);
+        check("램이 클럭에 맞춰 쓰고 늘 읽는다",
+              ports && beforeEdge == 0 && atEdge == 200 && keptAfter == 200 && other == 0, buf);
+    }
+
+    // 48. 폭·클럭·램 속이 저장됐다 돌아온다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int pin = addComp(world, PIN_IN, 50, 50);
+        world.comps[pin].aux = 12; resizePorts(world.comps[pin]);      // 12비트 핀
+        int ck  = addComp(world, CLOCK, 150, 50); world.comps[ck].aux = 4;
+        int ram = addComp(world, RAM, 250, 50);
+        world.comps[ram].mem.assign(RAM_WORDS, 0);
+        world.comps[ram].mem[3] = 77; world.comps[ram].mem[200] = 255;
+        bool wrote = saveState();
+
+        world = SubSim{}; chips.clear();
+        bool read = loadState();
+        bool widthOK = read && (int)world.comps.size() > pin && widthOf(world.comps[pin]) == 12
+                       && outWidth(world.comps[pin], 0) == 12;
+        bool clkOK   = read && (int)world.comps.size() > ck && world.comps[ck].aux == 4;
+        bool memOK   = read && (int)world.comps.size() > ram
+                       && world.comps[ram].mem.size() == (size_t)RAM_WORDS
+                       && world.comps[ram].mem[3] == 77 && world.comps[ram].mem[200] == 255;
+        std::snprintf(buf, sizeof(buf), "폭 12 %d, 클럭 주기 %d, 램[3]=%d·램[200]=%d",
+                      (int)widthOK, clkOK ? world.comps[ck].aux : -1,
+                      memOK ? (int)world.comps[ram].mem[3] : -1,
+                      memOK ? (int)world.comps[ram].mem[200] : -1);
+        check("폭·클럭·램 속이 저장된다", wrote && read && widthOK && clkOK && memOK, buf);
+        std::remove(savePath().c_str());
+    }
+
+    // 49. 클럭·묶음·램을 진짜로 이어서 돌려 본다 (CPU 의 뼈대)
+    //     손으로 값을 꽂지 않고, 판에 회로를 짜서 시뮬레이션만으로 확인한다.
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int ram = addComp(world, RAM, 600, 200);
+        int ck  = addComp(world, CLOCK, 100, 500);
+        world.comps[ck].aux = 1;                       // 2틱마다 뒤집힘
+
+        // 주소 8비트 = 스위치 여덟 → 묶음
+        int abu = addComp(world, BUNDLE, 300, 100);
+        std::vector<int> asw;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, SWITCH, 100, 40 + i * 30);
+            asw.push_back(q); addWire(world, q, 0, abu, i);
+        }
+        // 데이터 8비트
+        int dbu = addComp(world, BUNDLE, 300, 320);
+        std::vector<int> dsw;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, SWITCH, 100, 300 + i * 30);
+            dsw.push_back(q); addWire(world, q, 0, dbu, i);
+        }
+        int we = addComp(world, SWITCH, 300, 560);
+
+        addWire(world, abu, 0, ram, 0);
+        addWire(world, dbu, 0, ram, 1);
+        addWire(world, we,  0, ram, 2);
+        addWire(world, ck,  0, ram, 3);
+
+        // 램이 내보내는 값을 풀어서 전구 여덟으로
+        int osp = addComp(world, SPLIT, 800, 200);
+        addWire(world, ram, 0, osp, 0);
+        std::vector<int> lp;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, LAMP, 950, 40 + i * 30);
+            lp.push_back(q); addWire(world, osp, i, q, 0);
+        }
+        int wires = 0; for (auto& w : world.wires) if (w.alive) ++wires;
+
+        auto setBits = [&](std::vector<int>& v, int val) {
+            for (int i = 0; i < 8; ++i) setSwitch(v[i], (val >> i) & 1);
+        };
+        auto readLamps = [&] {
+            int g = 0;
+            for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) g |= (1 << i);
+            return g;
+        };
+
+        // 42번 자리에 137 을 쓴다 — 클럭이 알아서 올라갈 때까지 돌린다
+        setBits(asw, 42); setBits(dsw, 137); setSwitch(we, 1);
+        for (int i = 0; i < 40; ++i) tickSub(world);
+        int wrote137 = (int)world.comps[ram].mem[42];
+
+        // 쓰기 끄고 딴 값을 걸어 놔도 안 바뀌어야
+        setSwitch(we, 0); setBits(dsw, 3);
+        for (int i = 0; i < 40; ++i) tickSub(world);
+        int kept = (int)world.comps[ram].mem[42];
+        int shown = readLamps();
+
+        // 딴 자리로 주소를 옮기면 0 이 보인다
+        setBits(asw, 43);
+        for (int i = 0; i < 10; ++i) tickSub(world);
+        int elsewhere = readLamps();
+
+        // 그 자리에 5 를 쓰고 돌아와도 42번은 그대로
+        setBits(dsw, 5); setSwitch(we, 1);
+        for (int i = 0; i < 40; ++i) tickSub(world);
+        setSwitch(we, 0); setBits(asw, 42);
+        for (int i = 0; i < 10; ++i) tickSub(world);
+        int back = readLamps();
+
+        std::snprintf(buf, sizeof(buf),
+                      "선 %d개, 42번에 %d 씀, 쓰기 끄니 %d 유지(전구 %d), 43번은 %d, 돌아오니 %d",
+                      wires, wrote137, kept, shown, elsewhere, back);
+        check("클럭·묶음·램이 이어서 돈다",
+              wrote137 == 137 && kept == 137 && shown == 137 && elsewhere == 0 && back == 137, buf);
+    }
+
+    // 50. 화면에 쓰는 글자가 전부 글꼴에 있다
+    //     없는 기호를 쓰면 두부(□)가 나온다. ✎ 와 ▮ 로 두 번 당했다.
+    {
+        // 화면에 나오는 붙박이 글월 — 여기 없는 걸 새로 쓰면 이 검사에 안 걸리니
+        // 기호를 쓸 일이 생기면 여기에도 넣어야 한다.
+        static const char* USED[] = {
+            "셈틀", "손 (고르기)", "게이트로 묶기", "전체 지우기", "학습", "샌드박스",
+            "◀ 앞", "뒤 ▶", "힌트 (H)", "힌트 닫기", "채점하기  (Enter)", "×", "고",
+            "나가기  (Enter)", "계속하기  (Esc)", "첫 화면으로 나갈까?",
+            "고치는 중:  ", "Esc : 나가서 반영", "H 로 닫기", "저장됨", "멈춤 (P)",
+            "이렇게 돌아야 한다", "쓸 수 있는 것:", "핀 이름:", "커스텀 게이트 이름:",
+            "Enter 로 만들기 · Esc 로 취소", "Enter 로 고치기 · Esc 로 취소",
+            "고르면 바로 시작 · 안에서 Esc 로 여기 돌아옴 · [ ] 로 글자 크기",
+            "배선과 게이트만으로 회로를 조합하는 판",
+            "NAND 하나로 시작해서 계산기까지", "빈 판. 마음대로",
+            "Ctrl+Z=되돌리기 · Ctrl+S=내보내기 · Esc=첫 화면",
+            "Enter=채점 · Esc=첫 화면", "R=돌리기 · Ctrl+D=복사 · G=묶기",
+            "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
+            "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
+            "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
+        };
+        // 부품·단계 이름도 다 훑는다
+        std::vector<std::string> all;
+        for (auto* t : USED) all.push_back(t);
+        for (int i = 0; i < TYPE_N; ++i) all.push_back(TYPES[i].name);
+        for (int i = 0; i < LESSON_N; ++i) {
+            all.push_back(LESSONS[i].title);
+            all.push_back(LESSONS[i].text);
+            all.push_back(LESSONS[i].hint ? LESSONS[i].hint : "");
+            all.push_back(LESSONS[i].allow ? LESSONS[i].allow : "");
+            all.push_back(LESSONS[i].name ? LESSONS[i].name : "");
+            for (int k = 0; k < LESSONS[i].nIn; ++k)  all.push_back(LESSONS[i].inName[k]);
+            for (int k = 0; k < LESSONS[i].nOut; ++k) all.push_back(LESSONS[i].outName[k]);
+        }
+
+        int missing = 0; char first[64] = "";
+        if (!fontOK) std::snprintf(first, sizeof(first), "글꼴을 못 읽음");
+        else for (const auto& t : all) {
+            const char* p2 = t.c_str();
+            while (*p2) {
+                uint32_t cp = nextCp(p2);
+                if (cp == '\n' || cp == ' ' || cp < 32) continue;
+                if (stbtt_FindGlyphIndex(&font, (int)cp) == 0) {
+                    ++missing;
+                    if (!first[0]) std::snprintf(first, sizeof(first), "U+%04X 가 글꼴에 없음", cp);
+                }
+            }
+        }
+        if (missing) std::snprintf(buf, sizeof(buf), "%s (모두 %d자)", first, missing);
+        else         std::snprintf(buf, sizeof(buf), "글월 %d개 훑음, 빠진 글자 없음", (int)all.size());
+        check("쓰는 글자가 다 글꼴에 있다", fontOK && missing == 0, buf);
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -3704,6 +4782,51 @@ int main(int argc, char** argv) {
         say(b);
         sel = made; touch();
     };
+    // 폭 바꾸기 — 핀·묶음·풀음만. 폭이 바뀌면 그 포트에 걸린 선은 안 맞으니 끊는다.
+    auto doWidth = [&](int step) {
+        int changed = 0, cut = 0;
+        for (int i : sel) {
+            if (i < 0 || i >= (int)world.comps.size()) continue;
+            Comp& c = world.comps[i];
+            if (!c.alive || !hasWidth(c.type) || c.chipId >= 0) continue;
+            int w = std::clamp(widthOf(c) + step, 1, WIDTH_MAX);
+            if (w == widthOf(c)) continue;
+            c.aux = w;
+            resizePorts(c);
+            ++changed;
+            for (auto& wr : world.wires) {
+                if (!wr.alive) continue;
+                if ((wr.from == i || wr.to == i) &&
+                    !wireFits(world, wr.from, wr.fromPort, wr.to, wr.toPort)) {
+                    wr.alive = false; ++cut;
+                }
+            }
+        }
+        if (!changed) { say("폭을 바꿀 수 있는 건 핀·묶음·풀음뿐"); return; }
+        char b2[96];
+        if (cut) std::snprintf(b2, sizeof(b2), "폭 바꿈 %d개 — 안 맞는 선 %d개 끊김", changed, cut);
+        else     std::snprintf(b2, sizeof(b2), "폭 바꿈 %d개", changed);
+        say(b2);
+        touch();
+    };
+    // 클럭 빠르기
+    auto doClockSpeed = [&](int step) {
+        int changed = 0;
+        for (int i : sel) {
+            if (i < 0 || i >= (int)world.comps.size()) continue;
+            Comp& c = world.comps[i];
+            if (!c.alive || c.type != CLOCK) continue;
+            c.aux = std::clamp(c.aux + step, 0, CLOCK_N - 1);
+            ++changed;
+        }
+        if (changed) {
+            char b2[64];
+            std::snprintf(b2, sizeof(b2), "클럭 %d틱마다",
+                          CLOCK_TICKS[std::clamp(world.comps[sel[0]].aux, 0, CLOCK_N - 1)]);
+            say(b2); touch();
+        }
+    };
+
     auto doRotate = [&](int step) {
         if (sel.empty()) { say("돌릴 걸 먼저 골라 (R)"); return; }
         rotateSel(sel, step); touch();
@@ -3717,10 +4840,11 @@ int main(int argc, char** argv) {
                 --shotWait;
             } else {
                 static const char* NAMES[] = {
-                    "셈틀-첫화면.ppm", "셈틀-학습.ppm", "셈틀-샌드박스.ppm", "셈틀-고치기.ppm"
+                    "셈틀-첫화면.ppm", "셈틀-학습.ppm", "셈틀-샌드박스.ppm",
+                    "셈틀-부품.ppm", "셈틀-고치기.ppm"
                 };
                 if (shotAt > 0) writePPM(ren, NAMES[shotAt - 1]);
-                if (shotAt >= 4) { running = false; }
+                if (shotAt >= 5) { running = false; }
                 else {
                     // 다음 장면 차리기
                     editStack.clear(); dropHandles(); hintOn = false; uiOn = true;
@@ -3745,7 +4869,25 @@ int main(int argc, char** argv) {
                         screen = SC_SANDBOX;
                         if (!loadState()) { world = SubSim{}; seedDemo(); }
                         fitView();
-                    } else {                                 // 4) 칩 고치는 중
+                    } else if (shotAt == 3) {                // 4) 새 부품들
+                        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+                        int ck = addComp(world, CLOCK, 80, 260); world.comps[ck].aux = 3;
+                        int bu = addComp(world, BUNDLE, 300, 120);
+                        int sp = addComp(world, SPLIT, 700, 120);
+                        int ram = addComp(world, RAM, 480, 300);
+                        addWire(world, bu, 0, sp, 0);
+                        for (int i = 0; i < 8; ++i) {
+                            int q = addComp(world, SWITCH, 120, 20 + i * 46);
+                            addWire(world, q, 0, bu, i);
+                            if ((181 >> i) & 1) { auto& o = world.comps[q].out; if (!o.empty()) o[0] = 1; }
+                        }
+                        for (int i = 0; i < 8; ++i) {
+                            int q = addComp(world, LAMP, 880, 20 + i * 46);
+                            addWire(world, sp, i, q, 0);
+                        }
+                        addWire(world, ck, 0, ram, 3);
+                        fitView();
+                    } else {                                 // 5) 칩 고치는 중
                         screen = SC_SANDBOX;
                         if (!loadState()) { world = SubSim{}; seedDemo(); }
                         int target = -1;
@@ -3885,6 +5027,9 @@ int main(int argc, char** argv) {
                     else if (ctrl && k == SDLK_y)  doRedo();
                     else if (ctrl && k == SDLK_s)  doExport();
                     else if (ctrl && k == SDLK_o)  doImport();
+                    else if (k == SDLK_w)          doWidth(shift ? -1 : 1);
+                    else if (k == SDLK_COMMA)      doClockSpeed(-1);
+                    else if (k == SDLK_PERIOD)     doClockSpeed(1);
                     else if (k == SDLK_r)          doRotate(shift ? 3 : 1);
                     else if (ctrl && (k == SDLK_d || k == SDLK_c)) doCopy();
                     else if (k == SDLK_MINUS  || k == SDLK_KP_MINUS)
@@ -3933,8 +5078,8 @@ int main(int argc, char** argv) {
                             bool handled = false;
                             int nt = toolCount();
                             for (int i = 0; i < nt && !handled; ++i) {
+                                if (!toolVisible(i)) continue;
                                 Rect r = toolRect(i);
-                                if (r.y + r.h > btnBundle().y - 6) break;
                                 int cid = toolChip(i);
                                 // 지우기 단추가 줄 안에 들어 있으니 그쪽을 먼저 본다
                                 if (cid >= 0 && toolEditBtn(i).has(mx, my)) {
@@ -4021,7 +5166,7 @@ int main(int argc, char** argv) {
                     if (uiOn && mx < PANEL_W) {
                         int nt = toolCount();
                         for (int i = 0; i < nt; ++i)
-                            if (toolChip(i) >= 0 &&
+                            if (toolVisible(i) && toolChip(i) >= 0 &&
                                 (toolDelBtn(i).has(mx, my) || toolEditBtn(i).has(mx, my))) {
                                 hoverTool = i; break;
                             }
