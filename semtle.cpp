@@ -2204,6 +2204,16 @@ static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool) 
         }
     }
 
+    SDL_RenderSetClipRect(ren, nullptr);   // 목록 자르기 끝 — 안 풀면 뒤에 그리는 게 다 잘린다
+
+    // 굴릴 게 남았으면 위아래에 살짝 표시
+    if (toolScrollMax() > 0) {
+        if (toolScroll > 0)
+            fillRect(ren, { S(10), toolTop() - S(4), PANEL_W - S(20), S(2) }, 0x5A6070);
+        if (toolScroll < toolScrollMax())
+            fillRect(ren, { S(10), toolBot() + S(2), PANEL_W - S(20), S(2) }, 0x5A6070);
+    }
+
     Rect bb = btnBundle();
     bool can = selCount > 0;
     fillRect(ren, bb, can ? 0x2C4A3A : 0x232733);
@@ -4486,6 +4496,20 @@ static int runTests() {
 
 
 // 화면을 파일로 뽑는다 (문서에 넣을 그림용). 창을 안 띄우고도 된다.
+// 그 자리에 배경 아닌 것이 그려졌나 (판이 통째로 사라지는 걸 잡으려고)
+static bool anyPaint(SDL_Renderer* ren, int x, int y, int w, int h, uint32_t bg) {
+    if (w <= 0 || h <= 0) return false;
+    std::vector<uint8_t> px((size_t)w * h * 4);
+    SDL_Rect r{ x, y, w, h };
+    if (SDL_RenderReadPixels(ren, &r, SDL_PIXELFORMAT_ARGB8888, px.data(), w * 4) != 0)
+        return true;                       // 못 읽으면 넘어간다
+    for (int i = 0; i < w * h; ++i) {
+        uint32_t c = ((uint32_t)px[i*4+2] << 16) | ((uint32_t)px[i*4+1] << 8) | px[i*4+0];
+        if (c != bg) return true;
+    }
+    return false;
+}
+
 static void writePPM(SDL_Renderer* ren, const char* path) {
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(ren, &w, &h);
@@ -4548,6 +4572,7 @@ int main(int argc, char** argv) {
     // 그림 뽑기: 장면을 하나씩 차리고 한 프레임 그린 뒤 파일로 저장한다.
     int shotAt = shotMode ? 0 : -1;
     int shotWait = 0;
+    bool smokeBad = false;      // 스모크가 잡아낸 잘못
 
     // 화면 없이 그리기 경로가 안 죽는지 보는 모드. 네 방향·여러 배율을 다 훑는다.
     const bool smoke = env2("SEMTLE_SMOKE", "LOGIC_SMOKE") != nullptr;
@@ -5415,6 +5440,19 @@ int main(int argc, char** argv) {
 
         shotStep();
 
+        // 판이 통째로 안 그려지는 일이 있었다(자르기를 안 풀어서). 스모크에서 잡는다.
+        if (smoke && uiOn && screen != SC_MENU) {
+            if (!anyPaint(ren, 0, 0, PANEL_W, WIN_H, COL_BG)) {
+                std::fprintf(stderr, "왼쪽 도구판이 안 그려졌다\n");
+                smokeBad = true;
+            }
+            if (screen == SC_LEARN &&
+                !anyPaint(ren, WIN_W - LES_W, 0, LES_W, WIN_H, COL_BG)) {
+                std::fprintf(stderr, "오른쪽 설명판이 안 그려졌다\n");
+                smokeBad = true;
+            }
+        }
+
         SDL_RenderPresent(ren);
         ++frame;
     }
@@ -5427,5 +5465,5 @@ int main(int argc, char** argv) {
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    return 0;
+    return smokeBad ? 1 : 0;
 }
