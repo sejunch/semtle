@@ -2118,6 +2118,22 @@ static Rect toScreen(int wx, int wy, int ww, int wh) {
     return { sx, sy, std::max(1, w2sLen(ww)), std::max(1, w2sLen(wh)) };
 }
 
+// 굵은 선(여러 비트) 포트는 네모로, 한 비트짜리는 동그라미로 그린다.
+// 색도 선이랑 맞춘다 — 굵은 쪽은 파랑끼, 가는 쪽은 초록.
+static void drawPort(SDL_Renderer* ren, int sx, int sy, int r, int width, bool on) {
+    if (width <= 1) {
+        fillCircle(ren, sx, sy, r, on ? COL_ON : COL_OFF);
+        return;
+    }
+    uint32_t col = on ? 0x6AC8E0 : 0x3A4A54;
+    int h = r + std::max(1, r / 3);                 // 네모는 조금 크게
+    fillRect(ren, { sx - h, sy - h, h * 2, h * 2 }, col);
+    frameRect(ren, { sx - h, sy - h, h * 2, h * 2 }, shade(col, on ? 60 : 30));
+    // 가운데에 가로줄 하나 — '여러 가닥이 묶여 있다' 는 표시
+    if (r >= 4) fillRect(ren, { sx - h + 2, sy - 1, h * 2 - 4, std::max(1, r / 3) },
+                         shade(col, on ? -70 : -25));
+}
+
 static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
     const Comp& c = world.comps[idx];
     int w = compW(c), h = compH(c);
@@ -2214,13 +2230,15 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
     int pr = std::max(2, w2sLen(PORT_R));
     for (int p = 0; p < nOut(c); ++p) {
         int px, py; outPort(c, p, px, py);
-        bool v = p < (int)c.out.size() && c.out[p];
-        fillCircle(ren, w2sX((float)px), w2sY((float)py), pr, v ? COL_ON : COL_OFF);
+        bool v = p < (int)c.out.size() && c.out[p] != 0;
+        int wd = p < (int)c.outW.size() ? c.outW[p] : 1;
+        drawPort(ren, w2sX((float)px), w2sY((float)py), pr, wd, v);
     }
     for (int p = 0; p < nIn(c); ++p) {
         int px, py; inPort(c, p, px, py);
-        bool v = p < (int)c.in.size() && c.in[p];
-        fillCircle(ren, w2sX((float)px), w2sY((float)py), pr, v ? COL_ON : COL_OFF);
+        bool v = p < (int)c.in.size() && c.in[p] != 0;
+        int wd = p < (int)c.inW.size() ? c.inW[p] : 1;
+        drawPort(ren, w2sX((float)px), w2sY((float)py), pr, wd, v);
     }
 }
 
