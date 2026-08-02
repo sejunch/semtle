@@ -5998,13 +5998,23 @@ int main(int argc, char** argv) {
             && !draggingWire && !naming) {
             const Comp& c = world.comps[tipComp];
             const char* pn = portName(c, tipPort, tipIsIn);
-            char b[96];
-            if (pn) std::snprintf(b, sizeof(b), "%s", pn);
+            char nm[64];
+            if (pn) std::snprintf(nm, sizeof(nm), "%s", pn);
             else if (c.chipId >= 0)
-                std::snprintf(b, sizeof(b), "%s %d", tipIsIn ? "입력" : "출력", tipPort + 1);
+                std::snprintf(nm, sizeof(nm), "%s %d", tipIsIn ? "입력" : "출력", tipPort + 1);
             else if (isPin(c.type) || nIn(c) + nOut(c) > 0)
-                std::snprintf(b, sizeof(b), "%s", compName(c));
-            else b[0] = 0;
+                std::snprintf(nm, sizeof(nm), "%s", compName(c));
+            else nm[0] = 0;
+
+            // 몇 비트짜리인지, 지금 값이 얼마인지 같이 보여 준다
+            char b[128] = "";
+            if (nm[0]) {
+                int wd = tipIsIn ? inWidth(c, tipPort) : outWidth(c, tipPort);
+                Val v  = tipIsIn ? (tipPort < (int)c.in.size()  ? c.in[tipPort]  : 0)
+                                 : (tipPort < (int)c.out.size() ? c.out[tipPort] : 0);
+                if (wd > 1) std::snprintf(b, sizeof(b), "%s · %d비트 · %d", nm, wd, (int)v);
+                else        std::snprintf(b, sizeof(b), "%s · %d", nm, (int)(v ? 1 : 0));
+            }
             if (b[0]) {
                 int px, py;
                 if (tipIsIn) inPort(c, tipPort, px, py); else outPort(c, tipPort, px, py);
