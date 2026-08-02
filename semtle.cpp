@@ -617,6 +617,49 @@ static bool deleteChip(int chipId) {
 // 고른 것 복사 / 돌리기
 // ─────────────────────────────────────────────────────────────
 
+// 오려 둔 조각. Ctrl+C 로 담고 Ctrl+V 로 꺼낸다.
+struct Clip { std::vector<Comp> comps; std::vector<Wire> wires; };
+static Clip clipboard;
+
+// 고른 것들을 클립보드에 담는다 (판은 안 건드린다)
+static int copyToClip(const std::vector<int>& sel) {
+    clipboard.comps.clear(); clipboard.wires.clear();
+    std::unordered_map<int, int> map;
+    for (int i : sel) {
+        if (i < 0 || i >= (int)world.comps.size() || !world.comps[i].alive) continue;
+        Comp c = world.comps[i];
+        if (c.chipId >= 0 && c.sub) c.sub = std::make_shared<SubSim>(deepCopy(*c.sub));
+        map[i] = (int)clipboard.comps.size();
+        clipboard.comps.push_back(std::move(c));
+    }
+    for (const auto& w : world.wires) {          // 양 끝이 다 담긴 선만
+        if (!w.alive) continue;
+        auto f = map.find(w.from), g = map.find(w.to);
+        if (f != map.end() && g != map.end())
+            clipboard.wires.push_back({ f->second, w.fromPort, g->second, w.toPort, true });
+    }
+    return (int)clipboard.comps.size();
+}
+
+// 담아 둔 것을 그 자리에 꺼낸다. 새로 생긴 자리를 돌려준다.
+static std::vector<int> pasteClip(int atX, int atY) {
+    std::vector<int> made;
+    if (clipboard.comps.empty()) return made;
+    int minx = 1 << 30, miny = 1 << 30;
+    for (const auto& c : clipboard.comps) { minx = std::min(minx, c.x); miny = std::min(miny, c.y); }
+    int base = (int)world.comps.size();
+    for (const auto& c : clipboard.comps) {
+        Comp n = c;
+        if (c.chipId >= 0 && c.sub) n.sub = std::make_shared<SubSim>(deepCopy(*c.sub));
+        n.x = atX + (c.x - minx); n.y = atY + (c.y - miny);
+        made.push_back((int)world.comps.size());
+        world.comps.push_back(std::move(n));
+    }
+    for (const auto& w : clipboard.wires)
+        world.wires.push_back({ base + w.from, w.fromPort, base + w.to, w.toPort, true });
+    return made;
+}
+
 // 고른 부품들을 그대로 복제한다. 둘 다 안에 든 선도 같이 복사된다.
 // 새로 생긴 것들의 자리를 돌려주니 그대로 다시 고른 상태가 된다.
 static std::vector<int> duplicate(const std::vector<int>& sel, int offx, int offy) {
@@ -2143,6 +2186,8 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
     }
 }
 
+static int drawnSelWire = -1;      // 지금 골라 둔 선 (그리기용)
+
 static void drawWire(SDL_Renderer* ren, const Wire& w) {
     const Comp& a = world.comps[w.from];
     int pts[24][2]; wireCurve(w, pts, 24);
@@ -2151,6 +2196,10 @@ static void drawWire(SDL_Renderer* ren, const Wire& w) {
     uint32_t col = (wd > 1) ? (on ? 0x6AC8E0 : 0x3A4A54)      // 굵은 선은 파랑끼
                             : (on ? COL_ON : COL_OFF);
     int th = std::max(1, w2sLen(wd > 1 ? (on ? 7 : 6) : (on ? 4 : 3)));
+    // 골라 둔 선은 굵고 노랗게 — Del 로 지울 대상이 뭔지 보이게
+    bool picked = (&w >= world.wires.data() &&
+                   (int)(&w - world.wires.data()) == drawnSelWire);
+    if (picked) { col = COL_SEL; th += std::max(2, w2sLen(3)); }
     for (int k = 0; k < 23; ++k)
         thickLine(ren, w2sX((float)pts[k][0]),   w2sY((float)pts[k][1]),
                        w2sX((float)pts[k+1][0]), w2sY((float)pts[k+1][1]), th, col);
@@ -4454,6 +4503,13 @@ static int runTests() {
             "Enter=채점 · Esc=첫 화면", "R=돌리기 · Ctrl+D=복사 · G=묶기",
             "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
+            "손 도구", "선 고름 — Del 로 지운다",
+            "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구",
+            "R=돌리기 · Ctrl+C 복사 / Ctrl+V 붙여넣기 · Del=지우기 · G=묶기",
+            "Enter=채점 · Del=지우기 · Esc=첫 화면",
+            "Ctrl+Z=되돌리기 · Del=지우기 · Esc=첫 화면",
+            "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
+            "지울 걸 먼저 골라",
             "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
         };
         // 부품·단계 이름도 다 훑는다
@@ -4486,6 +4542,60 @@ static int runTests() {
         if (missing) std::snprintf(buf, sizeof(buf), "%s (모두 %d자)", first, missing);
         else         std::snprintf(buf, sizeof(buf), "글월 %d개 훑음, 빠진 글자 없음", (int)all.size());
         check("쓰는 글자가 다 글꼴에 있다", fontOK && missing == 0, buf);
+    }
+
+    // 51. 복사(Ctrl+C)는 판을 안 건드리고, 붙여넣기(Ctrl+V)가 꺼낸다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        clipboard.comps.clear(); clipboard.wires.clear();
+        int a2 = addComp(world, SWITCH, 100, 100), g = addComp(world, T_AND, 250, 120);
+        int b2 = addComp(world, SWITCH, 100, 220), l = addComp(world, LAMP, 400, 120);
+        addWire(world, a2, 0, g, 0); addWire(world, b2, 0, g, 1); addWire(world, g, 0, l, 0);
+        setSwitch(a2, 1); setSwitch(b2, 1); settle();
+        int before = 0; for (auto& c : world.comps) if (c.alive) ++before;
+
+        // 복사만 하면 판은 그대로여야 한다
+        int copied = copyToClip({ a2, b2, g, l });
+        int afterCopy = 0; for (auto& c : world.comps) if (c.alive) ++afterCopy;
+        bool untouched = (afterCopy == before);
+
+        // 붙여넣기는 그 자리에 꺼낸다
+        std::vector<int> made = pasteClip(700, 500);
+        settle();
+        int afterPaste = 0; for (auto& c : world.comps) if (c.alive) ++afterPaste;
+        bool grew = (afterPaste == before + 4) && ((int)made.size() == 4);
+        bool moved = grew && world.comps[made[0]].x == 700 && world.comps[made[0]].y == 500;
+        // 붙여넣은 것도 제대로 돈다 (안의 선까지 따라왔나)
+        int newLamp = -1;
+        for (int i : made) if (world.comps[i].type == LAMP) newLamp = i;
+        bool works = (newLamp >= 0) && lit(world.comps[newLamp]);
+        // 두 번 붙여넣어도 된다
+        std::vector<int> made2 = pasteClip(900, 700);
+        bool twice = ((int)made2.size() == 4);
+
+        std::snprintf(buf, sizeof(buf), "복사 %d개(판 %d→%d 그대로 %d), 붙여넣기 %d개·자리 %d·돌아감 %d, 또 %d",
+                      copied, before, afterCopy, (int)untouched,
+                      (int)made.size(), (int)moved, (int)works, (int)twice);
+        check("복사와 붙여넣기가 따로 논다",
+              copied == 4 && untouched && grew && moved && works && twice, buf);
+        clipboard.comps.clear(); clipboard.wires.clear();
+    }
+
+    // 52. 붙여넣기는 반만 고른 선을 안 가져온다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        clipboard.comps.clear(); clipboard.wires.clear();
+        int a3 = addComp(world, SWITCH, 100, 100), l3 = addComp(world, LAMP, 400, 100);
+        addWire(world, a3, 0, l3, 0);
+        copyToClip({ a3 });                       // 스위치만 담는다
+        bool noWire = clipboard.wires.empty();
+        int before = 0; for (auto& w : world.wires) if (w.alive) ++before;
+        pasteClip(100, 400);
+        int after = 0; for (auto& w : world.wires) if (w.alive) ++after;
+        std::snprintf(buf, sizeof(buf), "담긴 선 %d개(0이어야), 붙인 뒤 판의 선 %d→%d",
+                      (int)clipboard.wires.size(), before, after);
+        check("반만 고르면 선은 안 담긴다", noWire && before == after, buf);
+        clipboard.comps.clear(); clipboard.wires.clear();
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
@@ -4601,6 +4711,7 @@ int main(int argc, char** argv) {
     bool draggingComp = false; int dragComp = -1, dragDX = 0, dragDY = 0; bool dragMoved = false;
     bool selecting = false; int selX0 = 0, selY0 = 0, selX1 = 0, selY1 = 0;   // 판 좌표
     std::vector<int> sel;
+    int selWire = -1;                  // 골라 둔 선 (Del 로 지운다)
     // 여럿 고른 걸 통째로 끌 때, 잡은 것에서 나머지가 얼마나 떨어져 있었나
     struct Follow { int i, dx, dy; };
     std::vector<Follow> dragBase;
@@ -4645,7 +4756,7 @@ int main(int argc, char** argv) {
 
     // 고른 것·끌던 것은 번호로 가리키는데 되돌리면 그 번호가 딴 걸 가리킬 수 있다
     auto dropHandles = [&] {
-        sel.clear(); dragBase.clear();
+        sel.clear(); selWire = -1; dragBase.clear();
         draggingWire = draggingComp = selecting = false;
         wireFromComp = dragComp = tipComp = -1;
     };
@@ -4800,12 +4911,47 @@ int main(int argc, char** argv) {
         SDL_StartTextInput();
     };
     // 고른 것 복사. 새로 만든 것이 고른 상태가 된다.
+    // Ctrl+C — 담기만 한다. 판은 안 바뀐다.
     auto doCopy = [&]() {
         if (sel.empty()) { say("복사할 걸 먼저 골라"); return; }
+        int n = copyToClip(sel);
+        char b[64]; std::snprintf(b, sizeof(b), "%d개 복사함 (Ctrl+V 로 붙여넣기)", n);
+        say(b);
+    };
+    // Ctrl+V — 커서 자리에 꺼낸다
+    auto doPaste = [&]() {
+        if (clipboard.comps.empty()) { say("복사해 둔 게 없음"); return; }
+        syncW();
+        std::vector<int> made = pasteClip(wx, wy);
+        sel = made;
+        char b[64]; std::snprintf(b, sizeof(b), "%d개 붙여넣음", (int)made.size());
+        say(b); touch();
+    };
+    // Ctrl+D — 그 자리에서 바로 복제 (담아 두지 않는다)
+    auto doDup = [&]() {
+        if (sel.empty()) { say("복제할 걸 먼저 골라"); return; }
         std::vector<int> made = duplicate(sel, 24, 24);
-        char b[64]; std::snprintf(b, sizeof(b), "%d개 복사함", (int)made.size());
+        char b[64]; std::snprintf(b, sizeof(b), "%d개 복제함", (int)made.size());
         say(b);
         sel = made; touch();
+    };
+    // Del — 고른 부품과 고른 선을 지운다
+    auto doDelete = [&]() {
+        int nc = 0, nw = 0;
+        for (int i : sel)
+            if (i >= 0 && i < (int)world.comps.size() && world.comps[i].alive) {
+                deleteComp(world, i); ++nc;
+            }
+        if (selWire >= 0 && selWire < (int)world.wires.size() && world.wires[selWire].alive) {
+            world.wires[selWire].alive = false; ++nw;
+        }
+        sel.clear(); selWire = -1;
+        if (!nc && !nw) { say("지울 걸 먼저 골라"); return; }
+        char b[64];
+        if (nc && nw)      std::snprintf(b, sizeof(b), "부품 %d개·선 %d개 지움", nc, nw);
+        else if (nc)       std::snprintf(b, sizeof(b), "부품 %d개 지움", nc);
+        else               std::snprintf(b, sizeof(b), "선 %d개 지움", nw);
+        say(b); touch();
     };
     // 폭 바꾸기 — 핀·묶음·풀음만. 폭이 바뀌면 그 포트에 걸린 선은 안 맞으니 끊는다.
     auto doWidth = [&](int step) {
@@ -5021,7 +5167,9 @@ int main(int argc, char** argv) {
                     bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
                     // Esc: 고른 게 있으면 그것만 놓고, 없으면 나갈지 묻는다
                     if (k == SDLK_ESCAPE) {
-                        if (tool != 0 || !sel.empty()) { tool = 0; sel.clear(); }
+                        if (tool != 0 || !sel.empty() || selWire >= 0) {
+                            tool = 0; sel.clear(); selWire = -1;
+                        }
                         else if (hintOn) hintOn = false;
                         else if (!editStack.empty()) { doEndEdit(); break; }
                         else { confirming = true; break; }
@@ -5056,7 +5204,10 @@ int main(int argc, char** argv) {
                     else if (k == SDLK_COMMA)      doClockSpeed(-1);
                     else if (k == SDLK_PERIOD)     doClockSpeed(1);
                     else if (k == SDLK_r)          doRotate(shift ? 3 : 1);
-                    else if (ctrl && (k == SDLK_d || k == SDLK_c)) doCopy();
+                    else if (ctrl && k == SDLK_c) doCopy();
+                    else if (ctrl && k == SDLK_v) doPaste();
+                    else if (ctrl && k == SDLK_d) doDup();
+                    else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) doDelete();
                     else if (k == SDLK_MINUS  || k == SDLK_KP_MINUS)
                         zoomAt(viewZoom / 1.25f, (canvasL() + canvasR())/2, WIN_H/2);
                     else if (k == SDLK_EQUALS || k == SDLK_KP_PLUS)
@@ -5145,11 +5296,17 @@ int main(int argc, char** argv) {
                         if (outPortAt(wx, wy, oc, op)) {              // 출력 포트 잡기 → 선 끌기
                             draggingWire = true; wireFromComp = oc; wireFromPort = op; break;
                         }
-                        if (tool > 0) {                              // 부품 놓기
-                            placeTool(tool, wx - GW_MIN/2, wy - 24); touch();
+                        int onComp = compAt(wx, wy);
+                        if (tool > 0) {
+                            // 빈 자리를 누르면 놓고, 이미 있는 걸 누르면 잡아서 옮긴다
+                            if (onComp < 0) { placeTool(tool, wx - GW_MIN/2, wy - 24); touch(); break; }
+                            draggingComp = true; dragComp = onComp; dragMoved = false;
+                            dragDX = wx - world.comps[onComp].x;
+                            dragDY = wy - world.comps[onComp].y;
+                            dragBase.clear();
                             break;
                         }
-                        int ci = compAt(wx, wy);                     // 손: 부품 잡기 / 판: 상자선택
+                        int ci = onComp;                             // 손: 부품 잡기 / 판: 상자선택
                         // 핀을 두 번 누르면 이름을 고치고, 칩 상자를 두 번 누르면 속으로 들어간다
                         if (ci >= 0 && e.button.clicks >= 2 && isPin(world.comps[ci].type)) {
                             startRename(ci); break;
@@ -5168,18 +5325,18 @@ int main(int argc, char** argv) {
                                         dragBase.push_back({ s, world.comps[s].x - world.comps[ci].x,
                                                                 world.comps[s].y - world.comps[ci].y });
                         } else {
+                            int wi = wireAt(wx, wy);                 // 선을 눌렀나
+                            if (wi >= 0) { selWire = wi; sel.clear(); break; }
+                            selWire = -1;
                             selecting = true; selX0 = selX1 = wx; selY0 = selY1 = wy; sel.clear();
                         }
                     } else if (e.button.button == SDL_BUTTON_MIDDLE) {
                         if (inPanel) break;                          // 화면 끌기
                         panning = true; panSX = mx; panSY = my; panVX = viewX; panVY = viewY;
                     } else if (e.button.button == SDL_BUTTON_RIGHT) {
-                        if (inPanel) break;
-                        syncW();
-                        int ci = compAt(wx, wy);
-                        if (ci >= 0) { deleteComp(world, ci); touch(); break; }
-                        int wi = wireAt(wx, wy);
-                        if (wi >= 0) { world.wires[wi].alive = false; touch(); }
+                        // 우클릭은 손 도구로 돌아가기. 지우기는 Del 이다.
+                        if (tool != 0) { tool = 0; say("손 도구"); }
+                        else if (!sel.empty() || selWire >= 0) { sel.clear(); selWire = -1; }
                     }
                     break;
                 }
@@ -5313,6 +5470,7 @@ int main(int argc, char** argv) {
         SDL_RenderSetClipRect(ren, &clip);
         drawGrid(ren);
 
+        drawnSelWire = selWire;
         for (const auto& w : world.wires)
             if (w.alive && world.comps[w.from].alive && world.comps[w.to].alive) drawWire(ren, w);
 
@@ -5387,10 +5545,14 @@ int main(int argc, char** argv) {
                          savedFlash > 30 ? 0x6C9E7A : 0x3A4A40, s);
             }
             const char* hint = !sel.empty()
-                ? "R=돌리기 · Ctrl+D=복사 · G=묶기"
-                : (screen == SC_LEARN
-                   ? "Enter=채점 · Esc=첫 화면"
-                   : "Ctrl+Z=되돌리기 · Ctrl+S=내보내기 · Esc=첫 화면");
+                ? "R=돌리기 · Ctrl+C 복사 / Ctrl+V 붙여넣기 · Del=지우기 · G=묶기"
+                : (selWire >= 0
+                   ? "선 고름 — Del 로 지운다"
+                   : (tool != 0
+                      ? "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구"
+                      : (screen == SC_LEARN
+                         ? "Enter=채점 · Del=지우기 · Esc=첫 화면"
+                         : "Ctrl+Z=되돌리기 · Del=지우기 · Esc=첫 화면")));
             drawText(ren, right - textWidth(11, hint), top + S(20), 11, 0x60646E, hint);
         }
 
