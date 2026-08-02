@@ -4505,9 +4505,10 @@ static int runTests() {
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
             "손 도구", "선 고름 — Del 로 지운다",
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
-            "R=돌리기 · Ctrl+C 복사 / Ctrl+V 붙여넣기 · Del=지우기 · G=묶기",
-            "Enter=채점 · Del=지우기 · 선은 우클릭으로 끊기",
-            "Ctrl+Z=되돌리기 · Del=지우기 · 선은 우클릭으로 끊기",
+            "Shift+클릭=하나씩 · R=돌리기 · Ctrl+C/V · Del=지우기 · G=묶기",
+            "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기",
+            "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기",
+            "넣음 · ", "뺌 · ", "개 고름",
             "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
             "지울 걸 먼저 골라",
             "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
@@ -4710,6 +4711,7 @@ int main(int argc, char** argv) {
     bool draggingWire = false; int wireFromComp = -1, wireFromPort = 0;
     bool draggingComp = false; int dragComp = -1, dragDX = 0, dragDY = 0; bool dragMoved = false;
     bool selecting = false; int selX0 = 0, selY0 = 0, selX1 = 0, selY1 = 0;   // 판 좌표
+    bool selAdd = false;               // Shift 로 끌면 이미 고른 것에 더한다
     std::vector<int> sel;
     int selWire = -1;                  // 골라 둔 선 (Del 로 지운다)
     // 여럿 고른 걸 통째로 끌 때, 잡은 것에서 나머지가 얼마나 떨어져 있었나
@@ -5307,6 +5309,22 @@ int main(int argc, char** argv) {
                             break;
                         }
                         int ci = onComp;                             // 손: 부품 잡기 / 판: 상자선택
+                        bool shiftNow = (SDL_GetModState() & KMOD_SHIFT) != 0;
+
+                        // Shift 로 누르면 고른 목록에 넣거나 뺀다 (끌지는 않는다)
+                        if (ci >= 0 && shiftNow) {
+                            bool had = false;
+                            for (size_t k = 0; k < sel.size(); ++k)
+                                if (sel[k] == ci) { sel.erase(sel.begin() + k); had = true; break; }
+                            if (!had) sel.push_back(ci);
+                            selWire = -1;
+                            char b2[48];
+                            std::snprintf(b2, sizeof(b2), "%s · %d개 고름",
+                                          had ? "뺌" : "넣음", (int)sel.size());
+                            say(b2);
+                            break;
+                        }
+
                         // 핀을 두 번 누르면 이름을 고치고, 칩 상자를 두 번 누르면 속으로 들어간다
                         if (ci >= 0 && e.button.clicks >= 2 && isPin(world.comps[ci].type)) {
                             startRename(ci); break;
@@ -5326,9 +5344,11 @@ int main(int argc, char** argv) {
                                                                 world.comps[s].y - world.comps[ci].y });
                         } else {
                             int wi = wireAt(wx, wy);                 // 선을 눌렀나
-                            if (wi >= 0) { selWire = wi; sel.clear(); break; }
+                            if (wi >= 0) { selWire = wi; if (!shiftNow) sel.clear(); break; }
                             selWire = -1;
-                            selecting = true; selX0 = selX1 = wx; selY0 = selY1 = wy; sel.clear();
+                            selecting = true; selAdd = shiftNow;
+                            selX0 = selX1 = wx; selY0 = selY1 = wy;
+                            if (!selAdd) sel.clear();                // Shift 면 있던 것에 더한다
                         }
                     } else if (e.button.button == SDL_BUTTON_MIDDLE) {
                         if (inPanel) break;                          // 화면 끌기
@@ -5415,13 +5435,16 @@ int main(int argc, char** argv) {
                             selecting = false;
                             int rx0 = std::min(selX0, selX1), ry0 = std::min(selY0, selY1);
                             int rx1 = std::max(selX0, selX1), ry1 = std::max(selY0, selY1);
-                            sel.clear();
+                            if (!selAdd) sel.clear();
                             for (int i = 0; i < (int)world.comps.size(); ++i) {
                                 if (!world.comps[i].alive) continue;
                                 Comp& c = world.comps[i];
                                 int w = compW(c), h = compH(c);
-                                if (c.x < rx1 && rx0 < c.x + w && c.y < ry1 && ry0 < c.y + h) sel.push_back(i);
+                                if (c.x < rx1 && rx0 < c.x + w && c.y < ry1 && ry0 < c.y + h) {
+                                    if (!inSel(sel, i)) sel.push_back(i);   // 두 번 안 들어가게
+                                }
                             }
+                            selAdd = false;
                         }
                     }
                     break;
@@ -5555,14 +5578,14 @@ int main(int argc, char** argv) {
                          savedFlash > 30 ? 0x6C9E7A : 0x3A4A40, s);
             }
             const char* hint = !sel.empty()
-                ? "R=돌리기 · Ctrl+C 복사 / Ctrl+V 붙여넣기 · Del=지우기 · G=묶기"
+                ? "Shift+클릭=하나씩 · R=돌리기 · Ctrl+C/V · Del=지우기 · G=묶기"
                 : (selWire >= 0
                    ? "선 고름 — Del 로 지운다"
                    : (tool != 0
                       ? "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)"
                       : (screen == SC_LEARN
-                         ? "Enter=채점 · Del=지우기 · 선은 우클릭으로 끊기"
-                         : "Ctrl+Z=되돌리기 · Del=지우기 · 선은 우클릭으로 끊기")));
+                         ? "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기"
+                         : "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기")));
             drawText(ren, right - textWidth(11, hint), top + S(20), 11, 0x60646E, hint);
         }
 
