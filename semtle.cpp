@@ -986,11 +986,10 @@ static int shownCount() { return (int)shownTools().size(); }
 // 부품이 많아지면 줄을 좁힌다. 그래도 넘치면 휠로 굴려 본다.
 static int toolTop()  { return S(72); }   // 찾기 칸 아래부터
 static int toolBot()  { return (WIN_H - S(84)) - S(6); }   // 아래 단추들 위
-static int toolPitch() {
-    int room = toolBot() - toolTop();
-    int n = std::max(1, shownCount());
-    return std::clamp(room / n, S(22), S(30));
-}
+// 줄 높이는 고정이다. 예전엔 다 들어가게 줄였는데, 그러면 칩이 쌓일수록
+// 줄이 빽빽해지고 굴릴 일이 없어져 휠이 안 먹는 것처럼 보였다.
+// 이제 넘치면 굴려서 본다.
+static int toolPitch() { return S(28); }
 static int toolScroll = 0;        // 목록을 얼마나 굴렸나 (픽셀)
 
 // 다 못 보여 줄 때 굴릴 수 있는 최대
@@ -4733,6 +4732,46 @@ static int runTests() {
         check("굴림 막대가 제자리에 있다", ok, ok ? "배율 셋 다 길 안에서 끝까지 감" : detail);
     }
 
+    // 55. 휠로 굴리면 실제로 줄이 움직인다
+    //     (예전에 굴리는 코드가 통째로 빠져 있었는데 아무도 못 잡았다)
+    {
+        int ow = WIN_W, oh = WIN_H; float ous = uiScale;
+        uiScale = 1.35f; applyUiScale();
+        WIN_W = WIN_W0; WIN_H = WIN_H0;
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); toolFind.clear(); toolScroll = 0;
+        // 붙박이 14 + 손 1 만으로는 안 넘칠 수 있으니 칩을 넉넉히 만든다
+        for (int i = 0; i < 12; ++i) {
+            int p2 = addComp(world, PIN_IN, 10, 10), q2 = addComp(world, PIN_OUT, 60, 10);
+            addWire(world, p2, 0, q2, 0);
+            char n[16]; std::snprintf(n, sizeof(n), "칩%d", i + 1);
+            createChip({ p2, q2 }, n);
+        }
+        world = SubSim{};
+
+        bool overflows = toolScrollMax() > 0;
+        int y0 = toolRect(0).y;
+        // 휠 한 칸 = 아래로
+        toolScroll -= -1 * S(40); clampToolScroll();
+        int y1 = toolRect(0).y;
+        // 위로 되돌리기
+        toolScroll -= 1 * S(40); clampToolScroll();
+        int y2 = toolRect(0).y;
+        // 아무리 위로 굴려도 처음보다 위로는 안 간다
+        for (int i = 0; i < 20; ++i) { toolScroll -= 1 * S(40); clampToolScroll(); }
+        int y3 = toolRect(0).y;
+        // 끝까지 내려도 마지막 줄이 자리 안
+        for (int i = 0; i < 40; ++i) { toolScroll -= -1 * S(40); clampToolScroll(); }
+        Rect last = toolRect(shownCount() - 1);
+        bool endOK = (last.y + last.h <= toolBot() + S(2));
+
+        uiScale = ous; applyUiScale(); WIN_W = ow; WIN_H = oh;
+        world = SubSim{}; chips.clear(); toolScroll = 0;
+        std::snprintf(buf, sizeof(buf), "넘침 %d, 첫 줄 y %d→%d→%d, 위 한계 %d, 끝까지 %d",
+                      (int)overflows, y0, y1, y2, y3, (int)endOK);
+        check("휠로 굴리면 줄이 움직인다",
+              overflows && y1 < y0 && y2 == y0 && y3 == y0 && endOK, buf);
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -5391,6 +5430,11 @@ int main(int argc, char** argv) {
 
                 case SDL_MOUSEWHEEL: {
                     int cx, cy; SDL_GetMouseState(&cx, &cy);
+                    if (uiOn && cx < PANEL_W) {              // 왼쪽 부품 목록 굴리기
+                        toolScroll -= e.wheel.y * S(40);
+                        clampToolScroll();
+                        break;
+                    }
                     if (cx < canvasL() || cx >= canvasR()) break;
                     if (SDL_GetModState() & KMOD_CTRL) {
                         zoomAt(viewZoom * (e.wheel.y > 0 ? 1.15f : 1/1.15f), cx, cy);
