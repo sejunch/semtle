@@ -2413,6 +2413,15 @@ static std::string savePathFor(int sc) {
 }
 static std::string savePath() { return savePathFor(screen == SC_MENU ? SC_SANDBOX : screen); }
 
+// 만든 칩은 모드와 상관없이 한 곳에 둔다. 학습에서 딴 걸 샌드박스에서도 쓴다.
+static std::string chipsPath() {
+    const char* over = env2("SEMTLE_SAVE", "LOGIC_SAVE");
+    if (over) return std::string(over) + ".chips";
+    const char* home = SDL_getenv("HOME");
+    if (!home) return "semtle-chips.txt";
+    return std::string(home) + "/.local/share/semtle/chips.txt";
+}
+
 // 부품 하나를 알맞은 크기의 빈 상태로 만든다
 static Comp blankComp(int type, int chipId) {
     Comp c; c.type = type; c.chipId = chipId;
@@ -2525,7 +2534,7 @@ static bool readSub(std::FILE* f, SubSim& s) {
     return true;
 }
 
-static bool saveTo(const std::string& path) {
+static bool saveTo(const std::string& path, bool withChips) {
     size_t slash = path.rfind('/');
     if (slash != std::string::npos) {          // 폴더가 없으면 만든다
         std::string dir = path.substr(0, slash);
@@ -2537,8 +2546,9 @@ static bool saveTo(const std::string& path) {
     if (!f) return false;
 
     std::fprintf(f, "셈틀 %d\n", SAVE_VER);
-    std::fprintf(f, "칩 %d\n", (int)chips.size());
-    for (const auto& ch : chips) {
+    // 판 저장본에는 칩을 안 쓴다 (칩은 chips.txt 에 따로). 내보내기만 같이 담는다.
+    std::fprintf(f, "칩 %d\n", withChips ? (int)chips.size() : 0);
+    if (withChips) for (const auto& ch : chips) {
         std::fprintf(f, "칩시작 %u %d %s\n", ch.color, (int)ch.alive, ch.name.c_str());
         writeSub(f, ch.tmpl);
         std::fprintf(f, "칩끝\n");
@@ -2554,7 +2564,29 @@ static bool saveTo(const std::string& path) {
     return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
-static bool saveState() { return saveTo(savePath()); }
+// 칩만 따로 쓴다
+static bool saveChipsFile() {
+    std::string path = chipsPath();
+    size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        std::string cmd = "mkdir -p '" + path.substr(0, slash) + "'";
+        if (std::system(cmd.c_str()) != 0) { }
+    }
+    std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    std::fprintf(f, "셈틀칩 %d\n", SAVE_VER);
+    std::fprintf(f, "칩 %d\n", (int)chips.size());
+    for (const auto& ch : chips) {
+        std::fprintf(f, "칩시작 %u %d %s\n", ch.color, (int)ch.alive, ch.name.c_str());
+        writeSub(f, ch.tmpl);
+        std::fprintf(f, "칩끝\n");
+    }
+    std::fclose(f);
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+static bool saveState() { return saveTo(savePath(), false) && saveChipsFile(); }
 
 // ─────────────────────────────────────────────────────────────
 // 되돌리기
@@ -2615,8 +2647,9 @@ static bool loadFrom(const std::string& path) {
 
     std::vector<Chip> oldChips = chips;      // 실패하면 되돌린다
     SubSim oldWorld = world;
-    chips.clear(); world = SubSim{};
+    world = SubSim{};                        // 판만 비운다 — 칩은 판이 가리키고 있다
     bool ok = false;
+    bool hadChips = false;                   // 이 파일이 칩을 담고 있었나
 
     do {
         int ver = 0, n = 0;
@@ -2627,6 +2660,8 @@ static bool loadFrom(const std::string& path) {
         if (ver < 1 || ver > SAVE_VER) break;
         fileVer = ver;
         if (std::fscanf(f, " 칩 %d", &n) != 1 || n < 0 || n > 5000) break;
+        hadChips = (n > 0);
+        if (hadChips) chips.clear();         // 파일이 칩을 담고 있으면 그것으로 갈아친다
         bool bad = false;
         for (int i = 0; i < n && !bad; ++i) {
             unsigned col = 0; int alive = 0;
@@ -2679,7 +2714,50 @@ static bool loadFrom(const std::string& path) {
     return ok;
 }
 
-static bool loadState() { return loadFrom(savePath()); }
+// 칩 파일 읽기
+static bool loadChipsFile() {
+    std::FILE* f = std::fopen(chipsPath().c_str(), "r");
+    if (!f) return false;
+    std::vector<Chip> got;
+    bool ok = false;
+    do {
+        int ver = 0, n = 0;
+        char head[32] = "";
+        if (std::fscanf(f, " %31s %d", head, &ver) != 2) break;
+        if (std::strcmp(head, "셈틀칩") != 0 || ver < 1 || ver > SAVE_VER) break;
+        fileVer = ver;
+        if (std::fscanf(f, " 칩 %d", &n) != 1 || n < 0 || n > 5000) break;
+        std::vector<Chip> save = chips;
+        chips.clear();                       // readSub 이 chips 크기를 본다
+        bool bad = false;
+        for (int i = 0; i < n && !bad; ++i) {
+            unsigned col = 0; int alive = 0;
+            if (std::fscanf(f, " 칩시작 %u %d ", &col, &alive) != 2) { bad = true; break; }
+            char name[128] = "";
+            if (!std::fgets(name, sizeof(name), f)) { bad = true; break; }
+            size_t len = std::strlen(name);
+            while (len && (name[len-1] == '\n' || name[len-1] == '\r')) name[--len] = 0;
+            Chip ch; ch.name = name; ch.color = col; ch.alive = alive != 0;
+            chips.push_back(std::move(ch));
+            if (!readSub(f, chips.back().tmpl)) { bad = true; break; }
+            migratePorts(chips.back().tmpl);
+            char end[32] = "";
+            if (std::fscanf(f, " %31s", end) != 1 || std::strcmp(end, "칩끝") != 0) bad = true;
+        }
+        if (bad) { chips = save; break; }
+        got = chips;
+        ok = true;
+    } while (false);
+    std::fclose(f);
+    if (ok) chips = got;
+    return ok;
+}
+
+static bool loadState() {
+    chips.clear();
+    loadChipsFile();                 // 칩은 모드와 상관없이 한 곳에서
+    return loadFrom(savePath());
+}
 
 // ─────────────────────────────────────────────────────────────
 // 파일 고르기 창
@@ -3341,7 +3419,7 @@ static int runTests() {
         setSwitch(sw, 1); settle();
 
         std::string out = savePath() + ".export";
-        bool wrote = saveTo(out);
+        bool wrote = saveTo(out, true);
         world = SubSim{}; chips.clear();                 // 싹 지우고
         bool read = loadFrom(out);
         bool ok = read && chips.size() == 1 && chips[0].name == "내보낼칩" &&
@@ -4790,6 +4868,69 @@ static int runTests() {
               overflows && y1 < y0 && y2 == y0 && y3 == y0 && endOK, buf);
     }
 
+    // 56. 학습에서 딴 칩을 샌드박스에서도 쓴다 (판은 여전히 따로)
+    {
+        std::remove(chipsPath().c_str());
+        std::remove(savePathFor(SC_LEARN).c_str());
+        std::remove(savePathFor(SC_SANDBOX).c_str());
+
+        // 학습에서 칩 하나 만들고 저장
+        screen = SC_LEARN; world = SubSim{}; chips.clear();
+        int p2 = addComp(world, PIN_IN, 40, 40), q2 = addComp(world, PIN_OUT, 240, 40);
+        addWire(world, p2, 0, q2, 0);
+        createChip({ p2, q2 }, "학습칩");
+        lessonAt = 5; lessonDone = 6;
+        bool w1 = saveState();
+
+        // 샌드박스로 가서 판을 따로 짜고 저장
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        // 샌드박스 판 저장본은 아직 없다. 그래도 칩은 넘어와야 한다.
+        bool r1 = loadState();
+        (void)r1;
+        bool chipCrossed = false;
+        for (auto& c : chips) if (c.alive && c.name == "학습칩") chipCrossed = true;
+        // 그 칩을 실제로 놓아 쓸 수 있어야 한다
+        int cid = -1;
+        for (int i = 0; i < (int)chips.size(); ++i) if (chips[i].alive) cid = i;
+        int inst = (cid >= 0) ? addChip(world, cid, 100, 100) : -1;
+        int sw = addComp(world, SWITCH, 20, 100), lp = addComp(world, LAMP, 300, 100);
+        if (inst >= 0) { addWire(world, sw, 0, inst, 0); addWire(world, inst, 0, lp, 0); }
+        setSwitch(sw, 1); settle();
+        bool works = (inst >= 0) && lit(world.comps[lp]);
+        addComp(world, T_NOR, 500, 300);                   // 샌드박스만의 판
+        bool w2 = saveState();
+
+        // 학습으로 돌아가면 판은 제 것, 칩은 그대로
+        screen = SC_LEARN; world = SubSim{}; chips.clear();
+        bool r2 = loadState();
+        int learnComps = 0, learnNor = 0;
+        for (auto& c : world.comps) if (c.alive) { ++learnComps; if (c.type == T_NOR) ++learnNor; }
+        bool stillHasChip = false;
+        for (auto& c : chips) if (c.alive && c.name == "학습칩") stillHasChip = true;
+        // 칩을 묶으면 판에 상자 하나가 남는다. 샌드박스에서 놓은 NOR 은 안 넘어와야 한다.
+        bool boardsSeparate = (learnComps == 1 && learnNor == 0);
+        bool progKept = (lessonAt == 5 && lessonDone == 6);
+
+        // 샌드박스 판은 제 것대로
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        loadState();
+        int sandComps = 0; for (auto& c : world.comps) if (c.alive) ++sandComps;
+
+        std::snprintf(buf, sizeof(buf),
+                      "판 저장본 없어도 칩 넘어감 %d·돌아감 %d·남음 %d, 판 %d/%d 따로 %d, 진도 %d, 다시 읽기 %d",
+                      (int)chipCrossed, (int)works, (int)stillHasChip,
+                      learnComps, sandComps,
+                      (int)(boardsSeparate && sandComps > learnComps), (int)progKept, (int)r2);
+        check("칩은 같이 쓰고 판은 따로다",
+              w1 && chipCrossed && works && w2 && r2 && stillHasChip
+              && boardsSeparate && sandComps > learnComps && progKept, buf);
+
+        std::remove(chipsPath().c_str());
+        std::remove(savePathFor(SC_LEARN).c_str());
+        std::remove(savePathFor(SC_SANDBOX).c_str());
+        screen = SC_SANDBOX; lessonAt = lessonDone = 0;
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -5075,7 +5216,7 @@ int main(int argc, char** argv) {
     auto doExport = [&] {
         std::string path;
         if (!fileDialog(true, path)) { say("파일 창을 못 띄움 (zenity 없음?)"); return; }
-        say(saveTo(path) ? "내보냄" : "내보내기 실패");
+        say(saveTo(path, true) ? "내보냄" : "내보내기 실패");
     };
     auto doImport = [&] {
         std::string path;
