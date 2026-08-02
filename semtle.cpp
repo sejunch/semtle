@@ -176,10 +176,21 @@ static const uint32_t CHIP_COLORS[] = {
     0x4C7A9E, 0x9E7A4C, 0x6E9E4C, 0x9E4C7A, 0x4C9E8E, 0x7A4C9E, 0x9E5A4C, 0x5A5A9E,
 };
 
+// aux 는 폭(아랫자리)과 접힘 표시(0x100)를 같이 들고 있다.
+static const int FOLD_BIT = 0x100;
+
 // 폭을 정할 수 있는 부품의 폭 (aux). 없으면 1.
 static int widthOf(const Comp& c) {
     if (!hasWidth(c.type) || c.chipId >= 0) return 1;
-    return std::clamp(c.aux <= 0 ? 1 : c.aux, 1, WIDTH_MAX);
+    int w = c.aux & 0xFF;
+    return std::clamp(w <= 0 ? 1 : w, 1, WIDTH_MAX);
+}
+// 접을 수 있는 것은 묶음·풀음뿐 (가닥이 여럿이라 자리를 많이 먹는다)
+static bool canFold(const Comp& c) {
+    return c.chipId < 0 && (c.type == BUNDLE || c.type == SPLIT) && widthOf(c) > 2;
+}
+static bool isFolded(const Comp& c) {
+    return canFold(c) && (c.aux & FOLD_BIT);
 }
 
 // 입력·출력 포트 수
@@ -873,6 +884,7 @@ static int baseW(const Comp& c) {
     return std::max(GW_MIN, textWidth(15, compName(c)) + 26);
 }
 static int baseH(const Comp& c) {
+    if (isFolded(c)) return 52;          // 접으면 게이트만 한 크기
     return std::max(48, std::max(nIn(c), nOut(c)) * 20 + 12);
 }
 // 판 위에서 차지하는 크기 (돌린 걸 반영)
@@ -2191,13 +2203,24 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
                       0xE0C0E8, b2);
         }
     } else if (c.type == BUNDLE || c.type == SPLIT) {
-        fillRect(ren, box, shade(base, -14));
+        bool fold = isFolded(c);
+        fillRect(ren, box, shade(base, fold ? -24 : -14));
         frameRect(ren, box, shade(base, 45));
-        drawTextC(ren, cx, box.y + box.h/2 - ts, ts, COL_TEXT, compName(c));
-        if (viewZoom > 0.5f) {
-            char b2[24]; std::snprintf(b2, sizeof(b2), "%d비트", widthOf(c));
-            drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
-                      0xA0D0D0, b2);
+        if (fold) {
+            // 접힘 — 이름을 짧게 쓰고 접혔다는 표시를 그린다
+            char b2[24]; std::snprintf(b2, sizeof(b2), "%d", widthOf(c));
+            drawTextC(ren, cx, box.y + box.h/2 - ts*3/5, ts, COL_TEXT, b2);
+            int m = std::max(2, w2sLen(4));
+            for (int k = 0; k < 3; ++k)      // 접힌 가닥을 뜻하는 잔줄
+                fillRect(ren, { box.x + box.w/2 - m*3, box.y + box.h - m*3 + k*m,
+                                m*6, std::max(1, m/2) }, shade(base, 70));
+        } else {
+            drawTextC(ren, cx, box.y + box.h/2 - ts, ts, COL_TEXT, compName(c));
+            if (viewZoom > 0.5f) {
+                char b2[24]; std::snprintf(b2, sizeof(b2), "%d비트", widthOf(c));
+                drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
+                          0xA0D0D0, b2);
+            }
         }
     } else if (c.type == SWITCH || c.type == LAMP) {
         uint32_t col = on ? blend(base, COL_ON, 150) : shade(base, -30);
@@ -2484,7 +2507,10 @@ static bool readSub(std::FILE* f, SubSim& s) {
         Comp c = blankComp(type, chipId);
         c.x = x; c.y = y; c.rot = rot & 3; c.alive = alive != 0;
         c.label = lab;
-        if (chipId < 0 && hasWidth(type)) { c.aux = std::clamp(aux, 1, WIDTH_MAX); resizePorts(c); }
+        if (chipId < 0 && hasWidth(type)) {
+            c.aux = std::clamp(aux & 0xFF, 1, WIDTH_MAX) | (aux & FOLD_BIT);
+            resizePorts(c);
+        }
         else if (chipId < 0 && type == CLOCK) c.aux = std::clamp(aux, 0, CLOCK_N - 1);
         if (sw && !c.out.empty()) c.out[0] = maskTo((Val)sw, c.outW.empty() ? 1 : c.outW[0]);
         s.comps.push_back(std::move(c));
@@ -4654,8 +4680,9 @@ static int runTests() {
             "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
             "손 도구", "선 고름 — Del 로 지운다", "찾기 (/)", "찾는 게 없다",
+            "접을 수 있는 건 묶음·풀음뿐 (3비트부터)", "개 접음", "개 펼침",
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
-            "Shift+클릭=하나씩 · R=돌리기 · Ctrl+C/V · Del=지우기 · G=묶기",
+            "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · Ctrl+C/V · Del=지우기 · G=묶기",
             "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기",
             "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기",
             "넣음 · ", "뺌 · ", "개 고름",
@@ -4929,6 +4956,68 @@ static int runTests() {
         std::remove(savePathFor(SC_LEARN).c_str());
         std::remove(savePathFor(SC_SANDBOX).c_str());
         screen = SC_SANDBOX; lessonAt = lessonDone = 0;
+    }
+
+    // 57. 접어도 이어 둔 선이 안 끊기고, 상자만 작아진다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        int bu = addComp(world, BUNDLE, 300, 100);      // 8비트
+        int sp = addComp(world, SPLIT, 700, 100);
+        addWire(world, bu, 0, sp, 0);
+        std::vector<int> sw, lp;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, SWITCH, 60, 40 + i * 40);
+            sw.push_back(q); addWire(world, q, 0, bu, i);
+            int l = addComp(world, LAMP, 900, 40 + i * 40);
+            lp.push_back(l); addWire(world, sp, i, l, 0);
+        }
+        int want = 181;
+        for (int i = 0; i < 8; ++i) setSwitch(sw[i], (want >> i) & 1);
+        settle();
+        int got0 = 0; for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) got0 |= (1 << i);
+        int wires0 = 0; for (auto& w : world.wires) if (w.alive) ++wires0;
+        int h0 = compH(world.comps[bu]);
+        int cx0 = world.comps[bu].x + compW(world.comps[bu])/2;
+        int cy0 = world.comps[bu].y + compH(world.comps[bu])/2;
+
+        // 접는다
+        world.comps[bu].aux |= FOLD_BIT;
+        { Comp& c = world.comps[bu];             // 가운데 맞추기 (doFold 와 같은 계산)
+          c.x = cx0 - compW(c)/2; c.y = cy0 - compH(c)/2; }
+        settle();
+        int h1 = compH(world.comps[bu]);
+        int wires1 = 0; for (auto& w : world.wires) if (w.alive) ++wires1;
+        int got1 = 0; for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) got1 |= (1 << i);
+        bool ports = (nIn(world.comps[bu]) == 8);       // 포트 수는 그대로여야 한다
+        int cx1 = world.comps[bu].x + compW(world.comps[bu])/2;
+        int cy1 = world.comps[bu].y + compH(world.comps[bu])/2;
+        bool centered = std::abs(cx1 - cx0) <= 1 && std::abs(cy1 - cy0) <= 1;
+
+        // 저장했다 열어도 접힌 채로
+        bool w = saveState();
+        world = SubSim{}; chips.clear();
+        bool r = loadState();
+        bool keptFold = r && (int)world.comps.size() > bu && isFolded(world.comps[bu]);
+        bool keptW = keptFold && widthOf(world.comps[bu]) == 8;
+        settle();
+        int got2 = 0;
+        for (int i = 0; i < 8 && (int)world.comps.size() > lp[i]; ++i)
+            if (lit(world.comps[lp[i]])) got2 |= (1 << i);
+
+        // 2비트짜리는 접을 게 없다
+        int small = addComp(world, BUNDLE, 10, 10);
+        world.comps[small].aux = 2; resizePorts(world.comps[small]);
+        bool noSmall = !canFold(world.comps[small]);
+
+        std::snprintf(buf, sizeof(buf),
+                      "높이 %d→%d, 선 %d→%d개, 값 %d→%d→%d, 포트 %d, 가운데 %d, 저장 %d·폭 %d, 2비트 막힘 %d",
+                      h0, h1, wires0, wires1, got0, got1, got2, (int)ports, (int)centered,
+                      (int)keptFold, (int)keptW, (int)noSmall);
+        check("접어도 선이 안 끊긴다",
+              h1 < h0 && wires1 == wires0 && got0 == want && got1 == want && got2 == want
+              && ports && centered && w && keptFold && keptW && noSmall, buf);
+        std::remove(savePath().c_str());
+        std::remove(chipsPath().c_str());
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
@@ -5288,6 +5377,28 @@ int main(int argc, char** argv) {
         else               std::snprintf(b, sizeof(b), "선 %d개 지움", nw);
         say(b); touch();
     };
+    // 접기/펼치기 — 묶음·풀음의 상자를 작게 줄인다. 이어 둔 선은 그대로다.
+    auto doFold = [&](int only) {
+        std::vector<int> targets;
+        if (only >= 0) targets.push_back(only);
+        else targets = sel;
+        int n = 0; bool nowFold = true;
+        for (int i : targets) {
+            if (i < 0 || i >= (int)world.comps.size()) continue;
+            Comp& c = world.comps[i];
+            if (!c.alive || !canFold(c)) continue;
+            if (n == 0) nowFold = !isFolded(c);        // 첫 것에 맞춰 다 같이
+            int cx0 = c.x + compW(c)/2, cy0 = c.y + compH(c)/2;
+            c.aux = nowFold ? (c.aux | FOLD_BIT) : (c.aux & ~FOLD_BIT);
+            c.x = cx0 - compW(c)/2; c.y = cy0 - compH(c)/2;   // 가운데는 그대로
+            ++n;
+        }
+        if (!n) { say("접을 수 있는 건 묶음·풀음뿐 (3비트부터)"); return; }
+        char b2[64];
+        std::snprintf(b2, sizeof(b2), "%d개 %s", n, nowFold ? "접음" : "펼침");
+        say(b2); touch();
+    };
+
     // 폭 바꾸기 — 핀·묶음·풀음만. 폭이 바뀌면 그 포트에 걸린 선은 안 맞으니 끊는다.
     auto doWidth = [&](int step) {
         int changed = 0, cut = 0;
@@ -5382,6 +5493,7 @@ int main(int argc, char** argv) {
                         int sp = addComp(world, SPLIT, 700, 120);
                         int ram = addComp(world, RAM, 480, 300);
                         addWire(world, bu, 0, sp, 0);
+                        world.comps[sp].aux |= FOLD_BIT;      // 한쪽은 접어 놓고 견줘 본다
                         for (int i = 0; i < 8; ++i) {
                             int q = addComp(world, SWITCH, 120, 20 + i * 46);
                             addWire(world, q, 0, bu, i);
@@ -5566,6 +5678,7 @@ int main(int argc, char** argv) {
                     else if (ctrl && k == SDLK_y)  doRedo();
                     else if (ctrl && k == SDLK_s)  doExport();
                     else if (ctrl && k == SDLK_o)  doImport();
+                    else if (k == SDLK_q)          doFold(-1);
                     else if (k == SDLK_w)          doWidth(shift ? -1 : 1);
                     else if (k == SDLK_COMMA)      doClockSpeed(-1);
                     else if (k == SDLK_PERIOD)     doClockSpeed(1);
@@ -5718,6 +5831,10 @@ int main(int argc, char** argv) {
                         }
                         if (ci >= 0 && e.button.clicks >= 2 && world.comps[ci].chipId >= 0) {
                             doEditChip(world.comps[ci].chipId); break;
+                        }
+                        // 묶음·풀음을 두 번 누르면 접거나 편다
+                        if (ci >= 0 && e.button.clicks >= 2 && canFold(world.comps[ci])) {
+                            doFold(ci); break;
                         }
                         if (ci >= 0) {
                             draggingComp = true; dragComp = ci; dragMoved = false;
@@ -5972,7 +6089,7 @@ int main(int argc, char** argv) {
                          savedFlash > 30 ? 0x6C9E7A : 0x3A4A40, s);
             }
             const char* hint = !sel.empty()
-                ? "Shift+클릭=하나씩 · R=돌리기 · Ctrl+C/V · Del=지우기 · G=묶기"
+                ? "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · Ctrl+C/V · Del=지우기 · G=묶기"
                 : (selWire >= 0
                    ? "선 고름 — Del 로 지운다"
                    : (tool != 0
