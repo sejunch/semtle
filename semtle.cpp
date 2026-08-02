@@ -4504,10 +4504,10 @@ static int runTests() {
             "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
             "손 도구", "선 고름 — Del 로 지운다",
-            "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구",
+            "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
             "R=돌리기 · Ctrl+C 복사 / Ctrl+V 붙여넣기 · Del=지우기 · G=묶기",
-            "Enter=채점 · Del=지우기 · Esc=첫 화면",
-            "Ctrl+Z=되돌리기 · Del=지우기 · Esc=첫 화면",
+            "Enter=채점 · Del=지우기 · 선은 우클릭으로 끊기",
+            "Ctrl+Z=되돌리기 · Del=지우기 · 선은 우클릭으로 끊기",
             "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
             "지울 걸 먼저 골라",
             "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
@@ -5334,7 +5334,17 @@ int main(int argc, char** argv) {
                         if (inPanel) break;                          // 화면 끌기
                         panning = true; panSX = mx; panSY = my; panVX = viewX; panVY = viewY;
                     } else if (e.button.button == SDL_BUTTON_RIGHT) {
-                        // 우클릭은 손 도구로 돌아가기. 지우기는 Del 이다.
+                        // 선 위에서는 바로 끊고, 그 밖에서는 손 도구로 돌아간다
+                        if (!inPanel) {
+                            syncW();
+                            int wi = wireAt(wx, wy);
+                            if (wi >= 0) {
+                                world.wires[wi].alive = false;
+                                if (selWire == wi) selWire = -1;
+                                touch();
+                                break;
+                            }
+                        }
                         if (tool != 0) { tool = 0; say("손 도구"); }
                         else if (!sel.empty() || selWire >= 0) { sel.clear(); selWire = -1; }
                     }
@@ -5549,10 +5559,10 @@ int main(int argc, char** argv) {
                 : (selWire >= 0
                    ? "선 고름 — Del 로 지운다"
                    : (tool != 0
-                      ? "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구"
+                      ? "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)"
                       : (screen == SC_LEARN
-                         ? "Enter=채점 · Del=지우기 · Esc=첫 화면"
-                         : "Ctrl+Z=되돌리기 · Del=지우기 · Esc=첫 화면")));
+                         ? "Enter=채점 · Del=지우기 · 선은 우클릭으로 끊기"
+                         : "Ctrl+Z=되돌리기 · Del=지우기 · 선은 우클릭으로 끊기")));
             drawText(ren, right - textWidth(11, hint), top + S(20), 11, 0x60646E, hint);
         }
 
