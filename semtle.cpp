@@ -963,31 +963,66 @@ static void wireCurve(const Wire& w, int out[][2], int n);
 
 // 도구 자리: 0 = 손, 1..TYPE_N = 붙박이, 그 뒤 = 살아 있는 칩들
 static int toolCount() { return 1 + TYPE_N + (int)liveChips().size(); }
+
+// 목록 찾기. 여기 적은 글이 이름에 든 부품만 보인다.
+static std::string toolFind;
+static bool findOn = false;         // 찾는 글을 치는 중인가
+
+static const char* toolNameOf(int i);   // 앞선언
+
+// 지금 보여 줄 도구들 (canonical 번호). 찾는 글이 있으면 걸러진다.
+static std::vector<int> shownTools() {
+    std::vector<int> v;
+    int n = toolCount();
+    for (int i = 0; i < n; ++i) {
+        if (i == 0) { v.push_back(i); continue; }        // 손은 늘 보인다
+        if (toolFind.empty()) { v.push_back(i); continue; }
+        std::string nm = toolNameOf(i);
+        if (nm.find(toolFind) != std::string::npos) v.push_back(i);
+    }
+    return v;
+}
+static int shownCount() { return (int)shownTools().size(); }
 // 부품이 많아지면 줄을 좁힌다. 그래도 넘치면 휠로 굴려 본다.
-static int toolTop()  { return S(42); }
+static int toolTop()  { return S(72); }   // 찾기 칸 아래부터
 static int toolBot()  { return (WIN_H - S(84)) - S(6); }   // 아래 단추들 위
 static int toolPitch() {
     int room = toolBot() - toolTop();
-    int n = std::max(1, toolCount());
+    int n = std::max(1, shownCount());
     return std::clamp(room / n, S(22), S(30));
 }
 static int toolScroll = 0;        // 목록을 얼마나 굴렸나 (픽셀)
 
 // 다 못 보여 줄 때 굴릴 수 있는 최대
 static int toolScrollMax() {
-    int need = toolCount() * toolPitch();
+    int need = shownCount() * toolPitch();
     return std::max(0, need - (toolBot() - toolTop()));
 }
 static void clampToolScroll() { toolScroll = std::clamp(toolScroll, 0, toolScrollMax()); }
 
-static Rect toolRect(int i) {
+// row = 화면에 보이는 순서 (걸러진 뒤)
+static Rect toolRect(int row) {
     int p = toolPitch();
-    return { S(10), toolTop() + i * p - toolScroll, PANEL_W - S(20), p - S(3) };
+    return { S(10), toolTop() + row * p - toolScroll, PANEL_W - S(20) - S(8), p - S(3) };
 }
-// 그 줄이 보이는 자리에 있나
-static bool toolVisible(int i) {
-    Rect r = toolRect(i);
+static bool toolVisible(int row) {
+    Rect r = toolRect(row);
     return r.y >= toolTop() - r.h / 2 && r.y + r.h <= toolBot() + r.h / 2;
+}
+
+// 찾기 칸과 굴림 막대
+static Rect findBox() { return { S(10), S(38), PANEL_W - S(20), S(24) }; }
+static Rect scrollTrack() {
+    return { PANEL_W - S(14), toolTop(), S(6), toolBot() - toolTop() };
+}
+static Rect scrollThumb() {
+    Rect t = scrollTrack();
+    int need = shownCount() * toolPitch(), room = toolBot() - toolTop();
+    if (need <= room) return { t.x, t.y, t.w, t.h };
+    int hh = std::max(S(24), t.h * room / std::max(1, need));
+    int maxOff = toolScrollMax();
+    int y = t.y + (maxOff ? (t.h - hh) * toolScroll / maxOff : 0);
+    return { t.x, y, t.w, hh };
 }
 
 // 도구 자리가 칩이면 그 chipId, 아니면 -1
@@ -997,12 +1032,16 @@ static int toolChip(int i) {
     int k = i - 1 - TYPE_N;
     return (k >= 0 && k < (int)lc.size()) ? lc[k] : -1;
 }
+static const char* toolNameOf(int i);
+
 static const char* toolName(int i) {
     if (i == 0) return "손 (고르기)";
     if (i <= TYPE_N) return TYPES[i - 1].name;
     int c = toolChip(i);
     return c >= 0 ? chips[c].name.c_str() : "?";
 }
+static const char* toolNameOf(int i) { return toolName(i); }
+
 static bool toolHasColor(int i) { return i > 0; }
 static uint32_t toolColor(int i) {
     if (i >= 1 && i <= TYPE_N) return TYPES[i - 1].color;
@@ -2205,18 +2244,31 @@ static void drawWire(SDL_Renderer* ren, const Wire& w) {
                        w2sX((float)pts[k+1][0]), w2sY((float)pts[k+1][1]), th, col);
 }
 
-static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool) {
+static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool, int frame) {
     fillRect(ren, { 0, 0, PANEL_W, WIN_H }, COL_PANEL);
     fillRect(ren, { PANEL_W - 1, 0, 1, WIN_H }, COL_LINE);
     drawText(ren, S(14), S(12), 18, COL_TEXT, "셈틀");
 
+    // 찾기 칸
+    {
+        Rect fb = findBox();
+        fillRect(ren, fb, findOn ? 0x2A3244 : 0x20242E);
+        frameRect(ren, fb, findOn ? 0x6C86C8 : 0x2E3440);
+        std::string shownTxt = toolFind.empty() && !findOn ? "찾기 (/)" : toolFind;
+        if (findOn) shownTxt += ((frame / 30) % 2) ? "_" : " ";
+        drawText(ren, fb.x + S(8), fb.y + (fb.h - S(13)) / 2, 13,
+                 (toolFind.empty() && !findOn) ? 0x5E6472 : 0xD8DCE6, shownTxt.c_str());
+    }
+
     clampToolScroll();
-    int nt = toolCount();
+    std::vector<int> shown = shownTools();
+    int nt = (int)shown.size();
     // 목록 자리 밖으로 나간 줄은 안 그린다
     SDL_Rect listClip{ 0, toolTop() - S(4), PANEL_W, toolBot() - toolTop() + S(8) };
     SDL_RenderSetClipRect(ren, &listClip);
-    for (int i = 0; i < nt; ++i) {
-        Rect r = toolRect(i);
+    for (int row = 0; row < nt; ++row) {
+        int i = shown[row];
+        Rect r = toolRect(row);
         if (r.y + r.h < toolTop() - S(8)) continue;
         if (r.y > toolBot() + S(8)) break;
         bool on = (i == tool);
@@ -2232,14 +2284,14 @@ static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool) 
                  on ? 0xFFFFFF : (can ? COL_TEXT : 0x4E5462), toolName(i));
         (void)0;
         if (cid >= 0) {
-            Rect d = toolDelBtn(i);
-            bool hot = (i == hoverTool);
+            Rect d = toolDelBtn(row);
+            bool hot = (row == hoverTool);
             bool used = chipUses(cid) > 0 || editingChip(cid);
             fillRect(ren, d, hot ? (used ? 0x4A3038 : 0x5A2A32) : 0x2A2E38);
             uint32_t xc = used ? 0x70707E : (hot ? 0xFFC0C8 : 0xA0A4B0);
             drawTextC(ren, d.x + d.w/2, d.y + (d.h - S(13))/2, 13, xc, "×");
 
-            Rect ed = toolEditBtn(i);
+            Rect ed = toolEditBtn(row);
             bool nowEditing = editingChip(cid);
             fillRect(ren, ed, nowEditing ? 0x2C4A6A : 0x2A2E38);
             // 연필 그림(✎)은 글꼴에 없어서 두부처럼 나온다. 글자로 쓴다.
@@ -2255,13 +2307,15 @@ static void drawPanel(SDL_Renderer* ren, int tool, int selCount, int hoverTool) 
 
     SDL_RenderSetClipRect(ren, nullptr);   // 목록 자르기 끝 — 안 풀면 뒤에 그리는 게 다 잘린다
 
-    // 굴릴 게 남았으면 위아래에 살짝 표시
+    // 굴림 막대 — 넘칠 때만 보인다. 잡고 끌 수 있다.
     if (toolScrollMax() > 0) {
-        if (toolScroll > 0)
-            fillRect(ren, { S(10), toolTop() - S(4), PANEL_W - S(20), S(2) }, 0x5A6070);
-        if (toolScroll < toolScrollMax())
-            fillRect(ren, { S(10), toolBot() + S(2), PANEL_W - S(20), S(2) }, 0x5A6070);
+        fillRect(ren, scrollTrack(), 0x22262E);
+        fillRect(ren, scrollThumb(), 0x5A6070);
     }
+
+    // 찾는 중인데 걸린 게 없으면 알려 준다
+    if (!toolFind.empty() && nt <= 1)
+        drawText(ren, S(14), toolTop() + S(10), 12, 0x6E7484, "찾는 게 없다");
 
     Rect bb = btnBundle();
     bool can = selCount > 0;
@@ -3897,7 +3951,7 @@ static int runTests() {
             char n[16]; std::snprintf(n, sizeof(n), "칩%d", i + 1);
             createChip({ p2, q2 }, n);
         }
-        int nt = toolCount();
+        int nt = shownCount();
         // 끝까지 굴리면 마지막 줄이 자리 안에 들어와야 한다
         toolScroll = toolScrollMax();
         Rect last = toolRect(nt - 1);
@@ -4255,6 +4309,7 @@ static int runTests() {
         bool blockedPlace = false;
         for (int i = 1; i < toolCount(); ++i)
             if (toolChip(i) == 0) blockedPlace = !toolEnabled(i);
+        toolFind.clear();
         bool blockedReopen = !beginEdit(0);        // 열려 있는 걸 또 못 연다
         bool blockedDelete = !deleteChip(0);       // 고치는 중엔 못 지운다
         endEdit();
@@ -4503,7 +4558,7 @@ static int runTests() {
             "Enter=채점 · Esc=첫 화면", "R=돌리기 · Ctrl+D=복사 · G=묶기",
             "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
-            "손 도구", "선 고름 — Del 로 지운다",
+            "손 도구", "선 고름 — Del 로 지운다", "찾기 (/)", "찾는 게 없다",
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
             "Shift+클릭=하나씩 · R=돌리기 · Ctrl+C/V · Del=지우기 · G=묶기",
             "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기",
@@ -4597,6 +4652,85 @@ static int runTests() {
                       (int)clipboard.wires.size(), before, after);
         check("반만 고르면 선은 안 담긴다", noWire && before == after, buf);
         clipboard.comps.clear(); clipboard.wires.clear();
+    }
+
+    // 53. 목록 찾기가 걸러 준다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        toolFind.clear(); toolScroll = 0;
+        // 이름이 뚜렷한 칩 몇 개 만들어 둔다
+        const char* names[] = { "덧셈기8", "반가산기", "레지스터" };
+        for (const char* n : names) {
+            int p2 = addComp(world, PIN_IN, 100, 100), q2 = addComp(world, PIN_OUT, 300, 100);
+            addWire(world, p2, 0, q2, 0);
+            createChip({ p2, q2 }, n);
+        }
+        world = SubSim{};
+        int all = shownCount();
+
+        toolFind = "가산";                         // 덧셈기8 은 안 걸리고 반가산기만
+        std::vector<int> v1 = shownTools();
+        bool onlyAdder = ((int)v1.size() == 2) && v1[0] == 0 &&
+                         std::string(toolName(v1[1])) == "반가산기";
+
+        toolFind = "AND";                          // 붙박이 셋 (AND, NAND)
+        std::vector<int> v2 = shownTools();
+        int nAnd = 0;
+        for (size_t k = 1; k < v2.size(); ++k) {
+            std::string nm = toolName(v2[k]);
+            if (nm.find("AND") == std::string::npos) nAnd = -999;
+            else ++nAnd;
+        }
+
+        toolFind = "없는이름";                      // 손만 남아야
+        int nNone = shownCount();
+        bool onlyHand = (nNone == 1);
+
+        toolFind.clear();                          // 지우면 다 돌아온다
+        int nBack = shownCount();
+        bool back = (nBack == all);
+
+        std::snprintf(buf, sizeof(buf), "전부 %d개, '가산'→반가산기만 %d, 'AND'→%d개, 없는 이름→%d개(손만), 지우면 %d개",
+                      all, (int)onlyAdder, nAnd, nNone, nBack);
+        check("목록 찾기가 걸러 준다",
+              onlyAdder && nAnd == 2 && onlyHand && back, buf);
+        toolFind.clear();
+    }
+
+    // 54. 굴림 막대가 자리 안에 있고 끝까지 간다
+    {
+        int ow = WIN_W, oh = WIN_H; float ous = uiScale;
+        bool ok = true; char detail[140] = "";
+        for (float us : { 0.8f, 1.35f, 2.2f }) {
+            uiScale = us; applyUiScale();
+            WIN_W = WIN_W_MIN; WIN_H = WIN_H_MIN;
+            screen = SC_SANDBOX; world = SubSim{}; chips.clear(); toolFind.clear();
+            for (int i = 0; i < 8; ++i) {          // 넘치게 칩을 만든다
+                int p2 = addComp(world, PIN_IN, 10, 10), q2 = addComp(world, PIN_OUT, 60, 10);
+                addWire(world, p2, 0, q2, 0);
+                char n[16]; std::snprintf(n, sizeof(n), "칩%d", i + 1);
+                createChip({ p2, q2 }, n);
+            }
+            world = SubSim{};
+            if (toolScrollMax() <= 0) { ok = false; std::snprintf(detail, sizeof(detail), "배율 %.1f: 넘치지가 않음", us); continue; }
+
+            Rect t = scrollTrack();
+            toolScroll = 0;              Rect th0 = scrollThumb();
+            toolScroll = toolScrollMax(); Rect th1 = scrollThumb();
+            if (th0.y < t.y || th1.y + th1.h > t.y + t.h + 1) {
+                ok = false;
+                std::snprintf(detail, sizeof(detail), "배율 %.1f: 막대가 길 밖으로 (%d..%d, 길 %d..%d)",
+                              us, th0.y, th1.y + th1.h, t.y, t.y + t.h);
+            }
+            if (th1.y <= th0.y) {
+                ok = false;
+                std::snprintf(detail, sizeof(detail), "배율 %.1f: 굴려도 막대가 안 내려감", us);
+            }
+            toolScroll = 0;
+        }
+        uiScale = ous; applyUiScale(); WIN_W = ow; WIN_H = oh;
+        world = SubSim{}; chips.clear();
+        check("굴림 막대가 제자리에 있다", ok, ok ? "배율 셋 다 길 안에서 끝까지 감" : detail);
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
@@ -4726,6 +4860,7 @@ int main(int argc, char** argv) {
     int  mx = 0, my = 0;               // 화면 좌표
     int  wx = 0, wy = 0;               // 판 좌표 (히트 테스트는 다 이걸 쓴다)
     int  hoverTool = -1;
+    bool dragScroll = false; int scrollGrabY = 0;   // 굴림 막대를 잡고 있나
     // 커서가 올라간 포트 (말풍선으로 이름을 보여 준다)
     int  tipComp = -1, tipPort = 0; bool tipIsIn = false;
     char toast[128] = ""; int toastLeft = 0;
@@ -5077,6 +5212,36 @@ int main(int argc, char** argv) {
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            // ── 목록 찾기 글을 치는 중 ──
+            if (findOn && !naming && !confirming) {
+                if (e.type == SDL_TEXTINPUT) {
+                    if (toolFind.size() < 24) { toolFind += e.text.text; toolScroll = 0; }
+                    continue;
+                }
+                if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_BACKSPACE) {
+                        if (!toolFind.empty()) {
+                            toolFind.pop_back();
+                            while (!toolFind.empty() && (toolFind.back() & 0xC0) == 0x80)
+                                toolFind.pop_back();
+                        }
+                        toolScroll = 0;
+                        continue;
+                    }
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        findOn = false; SDL_StopTextInput(); continue;
+                    }
+                    if (k == SDLK_ESCAPE) {
+                        if (!toolFind.empty()) toolFind.clear();
+                        else { findOn = false; SDL_StopTextInput(); }
+                        toolScroll = 0;
+                        continue;
+                    }
+                    continue;                       // 다른 키는 안 먹는다
+                }
+            }
+
             // ── 나갈까 묻는 중이면 그것만 받는다 ──
             if (confirming) {
                 if (e.type == SDL_QUIT) running = false;
@@ -5179,6 +5344,7 @@ int main(int argc, char** argv) {
                     else if (k == SDLK_p)          paused = !paused;
                     else if (k == SDLK_BACKQUOTE)  tool = 0;
                     else if (k == SDLK_g)          startNaming();
+                    else if (k == SDLK_SLASH) { findOn = true; SDL_StartTextInput(); }
                     else if (k == SDLK_TAB) {
                         uiOn = !uiOn;
                         dropHandles();                 // 판이 사라지면 잡고 있던 것도 놓는다
@@ -5254,16 +5420,33 @@ int main(int argc, char** argv) {
                     if (e.button.button == SDL_BUTTON_LEFT) {
                         if (inPanel) {
                             bool handled = false;
-                            int nt = toolCount();
-                            for (int i = 0; i < nt && !handled; ++i) {
-                                if (!toolVisible(i)) continue;
-                                Rect r = toolRect(i);
+                            // 찾기 칸을 누르면 글 치는 중으로
+                            if (findBox().has(mx, my)) {
+                                findOn = true; SDL_StartTextInput(); handled = true;
+                            }
+                            // 굴림 막대를 잡았나
+                            if (!handled && toolScrollMax() > 0 && scrollTrack().has(mx, my)) {
+                                dragScroll = true; handled = true;
+                                Rect t = scrollTrack(), th = scrollThumb();
+                                if (!th.has(mx, my)) {          // 막대 밖을 누르면 그리로 뛴다
+                                    int rel = std::clamp(my - t.y - th.h / 2, 0, std::max(1, t.h - th.h));
+                                    toolScroll = toolScrollMax() * rel / std::max(1, t.h - th.h);
+                                    clampToolScroll();
+                                }
+                                scrollGrabY = my - scrollThumb().y;
+                            }
+                            std::vector<int> shown = shownTools();
+                            int nt = (int)shown.size();
+                            for (int row = 0; row < nt && !handled; ++row) {
+                                if (!toolVisible(row)) continue;
+                                int i = shown[row];
+                                Rect r = toolRect(row);
                                 int cid = toolChip(i);
                                 // 지우기 단추가 줄 안에 들어 있으니 그쪽을 먼저 본다
-                                if (cid >= 0 && toolEditBtn(i).has(mx, my)) {
+                                if (cid >= 0 && toolEditBtn(row).has(mx, my)) {
                                     doEditChip(cid);
                                     handled = true;
-                                } else if (cid >= 0 && toolDelBtn(i).has(mx, my)) {
+                                } else if (cid >= 0 && toolDelBtn(row).has(mx, my)) {
                                     int uses = chipUses(cid);
                                     if (uses > 0) {
                                         std::snprintf(toast, sizeof(toast),
@@ -5298,6 +5481,7 @@ int main(int argc, char** argv) {
                         if (outPortAt(wx, wy, oc, op)) {              // 출력 포트 잡기 → 선 끌기
                             draggingWire = true; wireFromComp = oc; wireFromPort = op; break;
                         }
+                        if (findOn) { findOn = false; SDL_StopTextInput(); }
                         int onComp = compAt(wx, wy);
                         if (tool > 0) {
                             // 빈 자리를 누르면 놓고, 이미 있는 걸 누르면 잡아서 옮긴다
@@ -5376,12 +5560,18 @@ int main(int argc, char** argv) {
                     syncW();
                     hoverTool = -1;
                     if (uiOn && mx < PANEL_W) {
-                        int nt = toolCount();
-                        for (int i = 0; i < nt; ++i)
-                            if (toolVisible(i) && toolChip(i) >= 0 &&
-                                (toolDelBtn(i).has(mx, my) || toolEditBtn(i).has(mx, my))) {
-                                hoverTool = i; break;
+                        std::vector<int> shown = shownTools();
+                        for (int row = 0; row < (int)shown.size(); ++row)
+                            if (toolVisible(row) && toolChip(shown[row]) >= 0 &&
+                                (toolDelBtn(row).has(mx, my) || toolEditBtn(row).has(mx, my))) {
+                                hoverTool = row; break;
                             }
+                    }
+                    if (dragScroll) {
+                        Rect t = scrollTrack(), th = scrollThumb();
+                        int span = std::max(1, t.h - th.h);
+                        toolScroll = toolScrollMax() * std::clamp(my - scrollGrabY - t.y, 0, span) / span;
+                        clampToolScroll();
                     }
                     if (panning) {
                         viewX = panVX - (mx - panSX) / viewZoom;
@@ -5411,6 +5601,7 @@ int main(int argc, char** argv) {
                 case SDL_MOUSEBUTTONUP: {
                     mx = e.button.x; my = e.button.y; syncW();
                     if (e.button.button == SDL_BUTTON_MIDDLE) panning = false;
+                    if (e.button.button == SDL_BUTTON_LEFT) dragScroll = false;
                     if (e.button.button == SDL_BUTTON_LEFT) {
                         if (draggingWire) {
                             int comp, port;
@@ -5549,7 +5740,7 @@ int main(int argc, char** argv) {
         }
 
         if (uiOn) {
-            drawPanel(ren, tool, (int)sel.size(), hoverTool);
+            drawPanel(ren, tool, (int)sel.size(), hoverTool, frame);
             if (screen == SC_LEARN) drawLessonPanel(ren, lesMsg, lesOK, lesLeft);
         } else {
             // 판이 없으면 어떻게 되돌리는지만 구석에 남겨 둔다
