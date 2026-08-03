@@ -4887,7 +4887,8 @@ static int runTests() {
             "줄 수는 화면만 바꾼다 (E)", "화면 ", "줄", "×",
             "접을 수 있는 건 묶음·풀음뿐 (3비트부터)", "개 접음", "개 펼침",
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
-            "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · Ctrl+C/V · Del=지우기 · G=묶기",
+            "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · F2=핀 이름 · Ctrl+C/V · G=묶기",
+            "핀 하나만 골라야 이름을 고친다", "핀을 고르거나 핀 위에서 F2",
             "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기",
             "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기",
             "넣음 · ", "뺌 · ", "개 고름",
@@ -5716,6 +5717,22 @@ int main(int argc, char** argv) {
         else               std::snprintf(b, sizeof(b), "선 %d개 지움", nw);
         say(b); touch();
     };
+    // 핀 이름 바꾸기 (F2). 골라 둔 핀 하나, 없으면 커서 밑의 핀.
+    auto doRenamePin = [&] {
+        int target = -1, npin = 0;
+        for (int i : sel)
+            if (i >= 0 && i < (int)world.comps.size() && world.comps[i].alive
+                && isPin(world.comps[i].type)) { target = i; ++npin; }
+        if (npin > 1) { say("핀 하나만 골라야 이름을 고친다"); return; }
+        if (target < 0) {
+            syncW();
+            int ci = compAt(wx, wy);
+            if (ci >= 0 && isPin(world.comps[ci].type)) target = ci;
+        }
+        if (target < 0) { say("핀을 고르거나 핀 위에서 F2"); return; }
+        startRename(target);
+    };
+
     // 접기/펼치기 — 묶음·풀음의 상자를 작게 줄인다. 이어 둔 선은 그대로다.
     auto doFold = [&](int only) {
         std::vector<int> targets;
@@ -6054,6 +6071,7 @@ int main(int argc, char** argv) {
                     else if (ctrl && k == SDLK_s)  doExport();
                     else if (ctrl && k == SDLK_o)  doImport();
                     else if (k == SDLK_e)          doRows(shift ? -1 : 1);
+                    else if (k == SDLK_F2)         doRenamePin();
                     else if (k == SDLK_q)          doFold(-1);
                     else if (k == SDLK_w)          doWidth(shift ? -1 : 1);
                     else if (k == SDLK_COMMA)      doClockSpeed(-1);
@@ -6201,10 +6219,7 @@ int main(int argc, char** argv) {
                             break;
                         }
 
-                        // 핀을 두 번 누르면 이름을 고치고, 칩 상자를 두 번 누르면 속으로 들어간다
-                        if (ci >= 0 && e.button.clicks >= 2 && isPin(world.comps[ci].type)) {
-                            startRename(ci); break;
-                        }
+                        // 칩 상자를 두 번 누르면 속으로 들어간다 (핀 이름은 F2)
                         if (ci >= 0 && e.button.clicks >= 2 && world.comps[ci].chipId >= 0) {
                             doEditChip(world.comps[ci].chipId); break;
                         }
@@ -6476,7 +6491,7 @@ int main(int argc, char** argv) {
                          savedFlash > 30 ? 0x6C9E7A : 0x3A4A40, s);
             }
             const char* hint = !sel.empty()
-                ? "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · Ctrl+C/V · Del=지우기 · G=묶기"
+                ? "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · F2=핀 이름 · Ctrl+C/V · G=묶기"
                 : (selWire >= 0
                    ? "선 고름 — Del 로 지운다"
                    : (tool != 0
