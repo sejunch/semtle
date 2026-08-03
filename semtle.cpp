@@ -198,6 +198,13 @@ static bool canFold(const Comp& c) {
 static bool isFolded(const Comp& c) {
     return canFold(c) && (c.aux & FOLD_BIT);
 }
+// 칸을 눌러 비트를 켜는 것들. 폭 있는 입력핀도 스위치묶음처럼 다룬다 —
+// 안 그러면 8비트 핀을 눌러도 0 아니면 1 밖에 못 넣는다.
+static bool isBitBank(const Comp& c) {
+    if (c.chipId >= 0) return false;
+    if (c.type == SWBANK) return true;
+    return c.type == PIN_IN && widthOf(c) > 1;
+}
 // 화면이 받는 줄 수 (n). 폭(m)은 widthOf 가 준다.
 static int screenRows(const Comp& c) {
     if (c.type != SCREEN) return 1;
@@ -903,12 +910,12 @@ static void zoomAt(float nz, int sx, int sy) {
 // 안 돌린 상태의 크기
 static int baseW(const Comp& c) {
     if (c.type == SCREEN) return std::max(GW_MIN, widthOf(c) * 14 + 20);
-    if (c.type == SWBANK) return std::max(GW_MIN, 64);
+    if (isBitBank(c)) return std::max(GW_MIN, textWidth(13, compName(c)) + 24);
     return std::max(GW_MIN, textWidth(15, compName(c)) + 26);
 }
 static int baseH(const Comp& c) {
     if (c.type == SCREEN) return std::max(48, screenRows(c) * 14 + 28);
-    if (c.type == SWBANK) return std::max(48, widthOf(c) * 20 + 24);
+    if (isBitBank(c)) return std::max(48, widthOf(c) * 20 + 34);
     if (isFolded(c)) return 52;          // 접으면 게이트만 한 크기
     return std::max(48, std::max(nIn(c), nOut(c)) * 20 + 12);
 }
@@ -1143,11 +1150,12 @@ static bool inPortAt(int mx, int my, int& comp, int& port) {
 }
 // 스위치묶음에서 누른 비트 자리 (없으면 -1)
 static int swBankBitAt(const Comp& c, int wx2, int wy2) {
-    if (c.type != SWBANK) return -1;
+    if (!isBitBank(c)) return -1;
     int w = compW(c), h = compH(c);
     if (wx2 < c.x || wx2 >= c.x + w || wy2 < c.y || wy2 >= c.y + h) return -1;
     int wd = widthOf(c), pad = 4;
-    int rowH = (h - 20 - pad) / std::max(1, wd);
+    int top = (c.type == PIN_IN) ? 18 : 0;
+    int rowH = (h - 20 - pad - top) / std::max(1, wd);
     if (rowH <= 0) return -1;
     int fromBottom = (c.y + h - 20) - wy2;
     if (fromBottom < 0) return -1;
@@ -1650,9 +1658,9 @@ static const Lesson LESSONS[] = {
     { "계산기", "24. 더하고 빼기",
       "덧셈기로 빼기도 한다.\n\n"
       "B 를 뒤집고 1 을 더하면 -B 가 된다(2의 보수).\n"
-      "네가 만든 4비트 가감산기와 같은 수법이다.\n\n"
-      "빼기 신호를 B 의 각 비트와 XOR 하고,\n"
-      "그 신호를 맨 아랫자리 올림입력에도 넣으면 된다.",
+      "그러면 A + (-B) 가 A - B 다.\n\n"
+      "빼기 신호를 B 의 각 비트와 XOR 하면 뒤집히고,\n"
+      "그 신호를 1 로도 쓰면 +1 까지 한꺼번에 된다.",
       3, 1, { "A", "B", "빼기" }, { "결과" },
       {}, "덧셈기8 묶음 풀음 XOR", true,
       "풀음으로 B 를 여덟 가닥 푼다.\n각 가닥을 빼기와 XOR 한다.\n묶음으로 다시 묶어 덧셈기8 의 B 에.\n빼기가 1이면 +1 도 해야 하는데,\n덧셈기8 에 올림입력이 없으니 A 쪽에 1을 더해도 된다.",
@@ -1856,17 +1864,22 @@ static bool gradeLesson(const Lesson& L, char* why, size_t whyN) {
 static void setupLesson(int at) {
     const Lesson& L = LESSONS[std::clamp(at, 0, LESSON_N - 1)];
     world = SubSim{};
+    // 폭 있는 입력핀은 칸이 여럿이라 키가 크다. 겹치지 않게 키만큼 띄운다.
+    int y = 60;
     for (int i = 0; i < L.nIn; ++i) {
-        int c = addComp(world, PIN_IN, 90, 120 + i * 110);
+        int c = addComp(world, PIN_IN, 90, y);
         world.comps[c].label = L.inName[i];
         world.comps[c].aux = lesInW(L, i);
         resizePorts(world.comps[c]);
+        y += compH(world.comps[c]) + 40;
     }
+    y = 80;
     for (int i = 0; i < L.nOut; ++i) {
-        int c = addComp(world, PIN_OUT, 560, 150 + i * 110);
+        int c = addComp(world, PIN_OUT, 620, y);
         world.comps[c].label = L.outName[i];
         world.comps[c].aux = lesOutW(L, i);
         resizePorts(world.comps[c]);
+        y += compH(world.comps[c]) + 40;
     }
     viewZoom = 1.0f; viewX = 0; viewY = 0;
 }
@@ -2267,7 +2280,33 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
     int   ts = std::max(7, (int)(15 * viewZoom));     // 글자 크기도 같이 줄고 는다
     int   cx = box.x + box.w / 2;
 
-    if (isPin(c.type)) {
+    if (isBitBank(c)) {
+        // 겉모습이 스위치 n개다. 칸을 눌러 그 비트를 켜고 끈다.
+        fillRect(ren, box, shade(base, -34));
+        frameRect(ren, box, shade(base, 40));
+        // 핀이면 이름을 위에 적어 준다 (어느 입력인지 알아야 하니까)
+        if (c.type == PIN_IN)
+            drawTextC(ren, cx, box.y + w2sLen(3), 13, 0xC8DCF4, compName(c));
+        int wd = widthOf(c);
+        Val v = c.out.empty() ? 0 : c.out[0];
+        int pad = std::max(2, w2sLen(4));
+        int top = (c.type == PIN_IN) ? w2sLen(18) : 0;
+        int rowH = (box.h - w2sLen(20) - pad - top) / std::max(1, wd);
+        for (int i = 0; i < wd; ++i) {
+            bool on = (v >> i) & 1;                     // 0번이 맨 아래
+            Rect r{ box.x + pad, box.y + box.h - w2sLen(20) - (i + 1) * rowH,
+                    box.w - pad * 2, std::max(2, rowH - 1) };
+            fillRect(ren, r, on ? blend(base, COL_ON, 170) : 0x252A30);
+            if (rowH >= w2sLen(9)) {
+                char d[2] = { (char)('0' + (on ? 1 : 0)), 0 };
+                drawTextC(ren, r.x + r.w/2, r.y + (r.h - S(11))/2, 11,
+                          on ? 0x0E140F : 0x6C7280, d);
+            }
+        }
+        char b2[24]; std::snprintf(b2, sizeof(b2), "%d", (int)v);
+        drawTextC(ren, cx, box.y + box.h - w2sLen(18), std::max(8, (int)(12 * viewZoom)),
+                  0xC8E8D0, b2);
+    } else if (isPin(c.type)) {
         // 핀은 제 이름이 곧 얼굴이다. 칩의 어느 포트가 될지 알아보게 테두리를 굵게.
         uint32_t col = on ? blend(base, COL_ON, 120) : shade(base, -34);
         fillRect(ren, box, col);
@@ -2311,28 +2350,6 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
             drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
                       0xE0C0E8, b2);
         }
-    } else if (c.type == SWBANK) {
-        // 겉모습이 스위치 n개다. 칸을 눌러 그 비트를 켜고 끈다.
-        fillRect(ren, box, shade(base, -34));
-        frameRect(ren, box, shade(base, 40));
-        int wd = widthOf(c);
-        Val v = c.out.empty() ? 0 : c.out[0];
-        int pad = std::max(2, w2sLen(4));
-        int rowH = (box.h - w2sLen(20) - pad) / std::max(1, wd);
-        for (int i = 0; i < wd; ++i) {
-            bool on = (v >> i) & 1;                     // 0번이 맨 아래
-            Rect r{ box.x + pad, box.y + box.h - w2sLen(20) - (i + 1) * rowH,
-                    box.w - pad * 2, std::max(2, rowH - 1) };
-            fillRect(ren, r, on ? blend(base, COL_ON, 170) : 0x252A30);
-            if (rowH >= w2sLen(9)) {
-                char d[2] = { (char)('0' + (on ? 1 : 0)), 0 };
-                drawTextC(ren, r.x + r.w/2, r.y + (r.h - S(11))/2, 11,
-                          on ? 0x0E140F : 0x6C7280, d);
-            }
-        }
-        char b2[24]; std::snprintf(b2, sizeof(b2), "%d", (int)v);
-        drawTextC(ren, cx, box.y + box.h - w2sLen(18), std::max(8, (int)(12 * viewZoom)),
-                  0xC8E8D0, b2);
     } else if (c.type == SCREEN) {
         // n줄 × m칸 점 격자. 입력 하나가 한 줄, 비트 하나가 점 하나.
         fillRect(ren, box, 0x14181E);
@@ -5293,6 +5310,49 @@ static int runTests() {
         check("화면이 줄마다 값을 받는다", def && five && four && got && big, buf);
     }
 
+    // 60. 폭 있는 입력핀은 칸을 눌러 비트를 넣는다 (스위치묶음과 같게)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        int p1 = addComp(world, PIN_IN, 100, 100);          // 1비트 — 예전처럼
+        int p8 = addComp(world, PIN_IN, 400, 100);
+        world.comps[p8].aux = 8; resizePorts(world.comps[p8]);
+
+        bool oneBitPlain = !isBitBank(world.comps[p1]);
+        bool eightIsBank = isBitBank(world.comps[p8]);
+        bool taller = compH(world.comps[p8]) > compH(world.comps[p1]);
+
+        // 칸을 눌러 181 을 만든다
+        int want = 181;
+        for (int i = 0; i < 8; ++i) {
+            Comp& c = world.comps[p8];
+            int w = compW(c), h = compH(c), wd = widthOf(c), pad = 4, top = 18;
+            int rowH = (h - 20 - pad - top) / wd;
+            int yy = (c.y + h - 20) - i * rowH - rowH / 2;
+            int bit = swBankBitAt(c, c.x + w / 2, yy);
+            if (bit == i && ((want >> i) & 1))
+                c.out[0] = maskTo((Val)(c.out[0] ^ (1u << bit)), wd);
+        }
+        // 그 값이 선을 타고 나가는지
+        int sp = addComp(world, SPLIT, 700, 100);
+        addWire(world, p8, 0, sp, 0);
+        std::vector<int> lp;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, LAMP, 900, 40 + i * 40);
+            lp.push_back(q); addWire(world, sp, i, q, 0);
+        }
+        settle();
+        int got = 0; for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) got |= (1 << i);
+
+        // 1비트 핀은 여전히 그냥 뒤집힌다
+        world.comps[p1].out[0] = !world.comps[p1].out[0];
+        bool plainWorks = (world.comps[p1].out[0] == 1);
+
+        std::snprintf(buf, sizeof(buf), "1비트는 그대로 %d, 8비트는 칸 %d·더 큼 %d, 눌러서 %d, 1비트 토글 %d",
+                      (int)oneBitPlain, (int)eightIsBank, (int)taller, got, (int)plainWorks);
+        check("폭 있는 입력핀은 칸으로 넣는다",
+              oneBitPlain && eightIsBank && taller && got == want && plainWorks, buf);
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -6250,13 +6310,15 @@ int main(int argc, char** argv) {
                             // 입력핀도 눌러서 켠다. 안 그러면 묶기 전에 회로를 못 돌려 본다.
                             int t = world.comps[dragComp].type;
                             bool flipped = false;
-                            if (!dragMoved && (t == SWITCH || t == PIN_IN)) {
+                            if (!dragMoved && (t == SWITCH || t == PIN_IN)
+                                && !isBitBank(world.comps[dragComp])) {
                                 auto& o = world.comps[dragComp].out;
                                 if (!o.empty()) { o[0] = !o[0]; flipped = true; }
                             }
-                            // 스위치묶음은 누른 칸의 비트만 뒤집는다
-                            if (!dragMoved && t == SWBANK) {
+                            // 여러 비트짜리는 누른 칸의 비트만 뒤집는다
+                            if (!dragMoved && isBitBank(world.comps[dragComp])) {
                                 Comp& c = world.comps[dragComp];
+                                (void)t;
                                 int bit = swBankBitAt(c, wx, wy);
                                 if (bit >= 0 && !c.out.empty()) {
                                     c.out[0] = maskTo((Val)(c.out[0] ^ (1u << bit)), widthOf(c));
