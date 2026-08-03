@@ -1216,7 +1216,7 @@ static bool hintOn = false;      // 지금 단계의 힌트를 펼쳤나
 // ─────────────────────────────────────────────────────────────
 
 // 지금 어느 화면인가
-enum Screen { SC_MENU, SC_LEARN, SC_SANDBOX };
+enum Screen { SC_MENU, SC_LEARN, SC_SANDBOX, SC_PICK };
 static int screen = SC_SANDBOX;
 
 static int lessonAt = 0;      // 지금 푸는 단계
@@ -1741,6 +1741,35 @@ static const Lesson LESSONS[] = {
 
 static const int LESSON_N = (int)(sizeof(LESSONS) / sizeof(LESSONS[0]));
 
+// 단계를 묶은 '부'. 난이도는 부마다 하나로 매긴다 —
+// 같은 부 안의 단계들은 어차피 비슷한 수준이라 따로 매길 게 없다.
+// first 는 그 부가 시작하는 단계 번호(0부터). 끝은 다음 부의 first 다.
+struct Part { const char* name; const char* what; int diff; int first; };
+static const Part PARTS[] = {
+    { "판에 익숙해지기",     "부품을 놓고 선을 잇는다",            1,  0 },
+    { "게이트 하나씩",       "여섯 게이트를 하나씩 써 본다",       1,  2 },
+    { "여러 개 이어 쓰기",   "게이트를 이어 붙여 답을 만든다",     2,  8 },
+    { "NAND 하나로 다시",    "NAND 만으로 나머지를 되만든다",      3, 11 },
+    { "덧셈",                "비트를 더하고 자리올림을 넘긴다",    3, 15 },
+    { "기억하는 회로",       "되먹여서 지난 일을 붙잡아 둔다",     4, 17 },
+    { "여덟 자리 다루기",    "선 여덟 가닥을 한 값으로 다룬다",    4, 20 },
+    { "계산과 세기",         "한 바이트를 더하고 스스로 센다",     4, 22 },
+    { "계산기",              "빼기와 명령 해독까지",               5, 24 },
+    { "컴퓨터",              "램의 프로그램을 스스로 읽어 돈다",   5, 26 },
+    { "보고 찍기",           "점 격자에 그림을 찍는다",            3, 28 },
+};
+static const int PART_N = (int)(sizeof(PARTS) / sizeof(PARTS[0]));
+static const int DIFF_MAX = 5;
+
+// 그 단계가 든 부
+static int partOf(int lesson) {
+    int p = 0;
+    for (int i = 0; i < PART_N; ++i) if (PARTS[i].first <= lesson) p = i;
+    return p;
+}
+// 그 부의 끝 (다음 부가 시작하는 자리)
+static int partEnd(int p) { return p + 1 < PART_N ? PARTS[p + 1].first : LESSON_N; }
+
 // 이 단계에서 쓸 수 있는 부품인가 (allow 가 빈 칸이면 다 된다)
 static bool lessonAllows(const Lesson& L, const char* partName) {
     if (!L.allow || !*L.allow) return true;
@@ -2002,6 +2031,28 @@ static std::vector<std::string> hintLines(const char* hint, int px, int maxW) {
 
 // 설명판 글자 크기 고르기. 창이 작으면 줄여서 단추를 안 밀어내고,
 // 큰 창에서는 큼직하게 둔다. 그리는 쪽과 검사가 같은 값을 보게 따로 뺐다.
+// 난이도를 작은 네모 다섯으로. 글꼴에 없는 기호를 쓰면 두부가 되니 직접 그린다.
+static void drawDiff(SDL_Renderer* ren, int x, int y, int d, bool dim = false) {
+    int w = S(9), h = S(9), gap = S(4);
+    for (int i = 0; i < DIFF_MAX; ++i) {
+        Rect r{ x + i * (w + gap), y, w, h };
+        if (i < d) fillRect(ren, r, dim ? 0x46536A : 0x8FB4D8);
+        else       frameRect(ren, r, dim ? 0x2E3440 : 0x3E4554);
+    }
+}
+static int diffW() { return DIFF_MAX * S(9) + (DIFF_MAX - 1) * S(4); }
+
+// 설명판 맨 위 '부' 머리말. 자리가 모자라면 소개 줄부터 접고, 더 모자라면 통째로 접는다.
+// (접혀도 같은 것을 단계 목록 화면에서 볼 수 있다.)
+static int lesHdrLv(int ts) { return ts >= 12 ? 2 : ts >= 10 ? 1 : 0; }
+static int lesHdrH(int ts) {
+    int lv = lesHdrLv(ts);
+    if (lv == 0) return 0;
+    return S(ts + 4) + (lv == 2 ? S(ts + 2) : 0) + S(10);
+}
+// 그 머리말을 누르면 단계 목록이 열린다
+static Rect lesHdr(int ts) { return { WIN_W - LES_W, 0, LES_W, S(14) + lesHdrH(ts) }; }
+
 struct LesFit { int ts, tl, rh, hs, need, room; };
 
 static LesFit lessonFit(const Lesson& L, int winH) {
@@ -2017,7 +2068,8 @@ static LesFit lessonFit(const Lesson& L, int winH) {
     for (;;) {
         f.tl = S(f.ts + 6);
         f.rh = S(f.ts + (tight ? 1 : 5));
-        f.need = S(34) + lines * f.tl + S(12) + (S(f.hs) + S(8)) + (f.rh + S(3)) + rows * f.rh
+        f.need = lesHdrH(f.ts)
+               + S(34) + lines * f.tl + S(12) + (S(f.hs) + S(8)) + (f.rh + S(3)) + rows * f.rh
                + (hasAllow ? S(40) : 0);
         if (f.need <= f.room || f.ts <= 9) break;
         --f.ts; if (f.hs > 11) --f.hs;
@@ -2043,6 +2095,24 @@ static void drawLessonPanel(SDL_Renderer* ren, const char* msg, bool msgOK, int 
     (void)lines; (void)rows; (void)hasAllow;
 
     int y = S(14);
+    if (lesHdrLv(ts)) {   // 부 머리말 — 어느 묶음이고 얼마나 어려운지. 누르면 단계 목록.
+        int pi = partOf(lessonAt);
+        const Part& P = PARTS[pi];
+        char h[128];
+        std::snprintf(h, sizeof(h), "%d부 · %s", pi + 1, P.name);
+        drawText(ren, p.x + S(16), y, ts - 1, 0x8FB4D8, h);
+        drawDiff(ren, p.x + LES_W - S(16) - diffW(), y + S(3), P.diff);
+        y += S(ts + 4);
+        if (lesHdrLv(ts) == 2) {
+            drawText(ren, p.x + S(16), y, ts - 4, 0x6E7484, P.what);
+            std::snprintf(h, sizeof(h), "%d / %d · 목록", lessonAt + 1, LESSON_N);
+            drawText(ren, p.x + LES_W - S(16) - textWidth(ts - 4, h), y, ts - 4, 0x8A90A0, h);
+            y += S(ts + 2);
+        }
+        setCol(ren, 0x2E3440);
+        SDL_RenderDrawLine(ren, p.x + S(16), y + S(4), p.x + LES_W - S(16), y + S(4));
+        y += S(10);
+    }
     drawText(ren, p.x + S(16), y, ts + 5, 0xE8ECF4, L.title); y += S(34);
 
     size_t s0 = 0;
@@ -2131,9 +2201,6 @@ static void drawLessonPanel(SDL_Renderer* ren, const char* msg, bool msgOK, int 
     frameRect(ren, g, 0x5A86BA);
     drawTextC(ren, g.x + g.w/2, g.y + (g.h - S(17))/2, 17, 0xD8E8FF, "채점하기  (Enter)");
 
-    char pr[48];
-    std::snprintf(pr, sizeof(pr), "%d / %d 단계", lessonAt + 1, LESSON_N);
-    drawText(ren, p.x + LES_W - textWidth(12, pr) - S(16), S(20), 12, 0x6E7484, pr);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2554,6 +2621,141 @@ static Rect menuBtn(int i) {
     return { WIN_W/2 - w/2, top + i * (h + gap), w, h };
 }
 
+// ─────────────────────────────────────────────────────────────
+// 단계 고르기 화면
+//
+// 서른 단계를 부로 묶어 늘어놓는다. 통과한 것과 지금 것과 아직 잠긴 것을
+// 한눈에 보이게 하고, 통과한 데로는 되돌아갈 수 있게 한다.
+// ─────────────────────────────────────────────────────────────
+
+static int pickScroll = 0;               // 목록을 굴린 만큼 (픽셀)
+
+static int pickColW() { return std::min(S(620), WIN_W - S(80)); }
+static int pickColX() { return WIN_W/2 - pickColW()/2; }
+static int pickTop()  { return S(96); }               // 제목 아래
+static int pickBot()  { return WIN_H - S(46); }       // 도움말 위
+static int pickPartH(){ return S(52); }
+static int pickLesH() { return S(34); }
+
+// 부 머리 하나 + 그 안의 단계들. 위에서부터 쌓은 높이를 돌려준다.
+static int pickHeight() {
+    return PART_N * pickPartH() + LESSON_N * pickLesH() + PART_N * S(10);
+}
+static int pickMaxScroll() { return std::max(0, pickHeight() - (pickBot() - pickTop())); }
+
+// 그 단계 줄이 목록 어디쯤에 있나 (맨 위에서부터의 높이)
+static int pickRowY(int at) {
+    int y = 0;
+    for (int p = 0; p < PART_N; ++p) {
+        y += pickPartH();
+        for (int i = PARTS[p].first; i < partEnd(p); ++i) {
+            if (i == at) return y;
+            y += pickLesH();
+        }
+        y += S(10);
+    }
+    return 0;
+}
+// 지금 단계가 가운데쯤 오게 굴린다
+static void pickScrollTo(int at) {
+    int room = pickBot() - pickTop();
+    pickScroll = std::clamp(pickRowY(at) - room / 2, 0, pickMaxScroll());
+}
+
+// 화면에서 그 자리에 있는 단계 (없으면 -1). 그리기와 누르기가 같은 셈을 쓴다.
+static int pickHit(int mx, int my) {
+    if (mx < pickColX() || mx > pickColX() + pickColW()) return -1;
+    if (my < pickTop() || my > pickBot()) return -1;
+    int y = pickTop() - pickScroll;
+    for (int p = 0; p < PART_N; ++p) {
+        y += pickPartH();
+        for (int i = PARTS[p].first; i < partEnd(p); ++i) {
+            if (my >= y && my < y + pickLesH()) return i;
+            y += pickLesH();
+        }
+        y += S(10);
+    }
+    return -1;
+}
+
+static void drawPick(SDL_Renderer* ren, int mx, int my) {
+    setCol(ren, 0x101219); SDL_RenderClear(ren);
+    setCol(ren, 0x171A23);
+    for (int x = 0; x < WIN_W; x += S(40)) SDL_RenderDrawLine(ren, x, 0, x, WIN_H);
+    for (int y = 0; y < WIN_H; y += S(40)) SDL_RenderDrawLine(ren, 0, y, WIN_W, y);
+
+    drawText(ren, pickColX(), S(34), 30, 0xE8ECF4, "학습");
+    char b[80];
+    std::snprintf(b, sizeof(b), "%d / %d 단계 통과", lessonDone, LESSON_N);
+    drawText(ren, pickColX() + pickColW() - textWidth(14, b), S(46), 14, 0x6E7484, b);
+
+    SDL_Rect clip{ 0, pickTop(), WIN_W, pickBot() - pickTop() };
+    SDL_RenderSetClipRect(ren, &clip);
+
+    int hit = pickHit(mx, my);
+    int x0 = pickColX(), w = pickColW();
+    int y = pickTop() - pickScroll;
+    for (int p = 0; p < PART_N; ++p) {
+        int lo = PARTS[p].first, hi = partEnd(p);
+        int done = std::min(std::max(lessonDone - lo, 0), hi - lo);
+        bool locked = (lo > lessonDone);
+
+        std::snprintf(b, sizeof(b), "%d부 · %s", p + 1, PARTS[p].name);
+        drawText(ren, x0, y + S(4), 18, locked ? 0x555B69 : 0xC8CEDC, b);
+        drawDiff(ren, x0 + w - diffW(), y + S(9), PARTS[p].diff, locked);
+        drawText(ren, x0 + w - diffW() - S(8) - textWidth(12, "난이도"), y + S(8), 12,
+                 locked ? 0x434956 : 0x5E6472, "난이도");
+        drawText(ren, x0, y + S(28), 13, locked ? 0x434956 : 0x767C8C, PARTS[p].what);
+        std::snprintf(b, sizeof(b), "%d / %d", done, hi - lo);
+        drawText(ren, x0 + w - diffW() - S(14) - textWidth(13, b), y + S(28), 13,
+                 done == hi - lo ? 0x6AA88A : 0x5E6472, b);
+        y += pickPartH();
+
+        for (int i = lo; i < hi; ++i) {
+            bool pass = (i < lessonDone), here = (i == lessonAt), shut = (i > lessonDone);
+            Rect r{ x0, y, w, pickLesH() - S(4) };
+            if (i == hit && !shut) fillRect(ren, r, 0x252A36);
+            else if (here)         fillRect(ren, r, 0x1E2632);
+            if (here) fillRect(ren, { r.x, r.y, S(3), r.h }, 0x5A86BA);
+
+            // 상태 표시 — 통과는 채운 네모, 지금은 반쯤, 잠긴 것은 빈 테두리
+            Rect m{ x0 + S(14), y + S(9), S(11), S(11) };
+            if (pass)      fillRect(ren, m, 0x4A9E6A);
+            else if (here) fillRect(ren, m, 0x5A86BA);
+            else           frameRect(ren, m, 0x3E4554);
+
+            std::snprintf(b, sizeof(b), "%d", i + 1);
+            drawText(ren, x0 + S(38), y + S(7), 14,
+                     shut ? 0x474D5A : 0x767C8C, b);
+            const char* t = LESSONS[i].title;
+            while (*t && *t != ' ') ++t;                 // 제목 앞 번호는 뗀다
+            while (*t == ' ') ++t;
+            drawText(ren, x0 + S(70), y + S(6), 16,
+                     shut ? 0x4E5462 : (here ? 0xFFFFFF : 0xC0C6D4), t);
+            if (LESSONS[i].bank && LESSONS[i].name && *LESSONS[i].name) {
+                std::snprintf(b, sizeof(b), "%s", LESSONS[i].name);
+                drawText(ren, x0 + w - textWidth(13, b) - S(6), y + S(8), 13,
+                         shut ? 0x434956 : (pass ? 0x6AA88A : 0x5E6472), b);
+            }
+            y += pickLesH();
+        }
+        y += S(10);
+    }
+    SDL_RenderSetClipRect(ren, nullptr);
+
+    // 굴림 막대
+    int room = pickBot() - pickTop(), full = pickHeight();
+    if (full > room) {
+        int bh = std::max(S(30), room * room / full);
+        int by = pickTop() + (room - bh) * pickScroll / std::max(1, pickMaxScroll());
+        fillRect(ren, { x0 + pickColW() + S(10), pickTop(), S(4), room }, 0x1D212B);
+        fillRect(ren, { x0 + pickColW() + S(10), by, S(4), bh }, 0x3E4554);
+    }
+
+    drawTextC(ren, WIN_W/2, WIN_H - S(30), 13, 0x484E5C,
+              "누르면 그 단계로 · 통과한 데까지만 갈 수 있다 · Esc 로 첫 화면");
+}
+
 static void drawMenu(SDL_Renderer* ren, int hover) {
     setCol(ren, 0x101219); SDL_RenderClear(ren);
 
@@ -2610,7 +2812,11 @@ static std::string savePathFor(int sc) {
     if (!home) return std::string("semtle-") + base;
     return std::string(home) + "/.local/share/semtle/" + base;
 }
-static std::string savePath() { return savePathFor(screen == SC_MENU ? SC_SANDBOX : screen); }
+// 목록 화면은 학습에 딸린 것이라 학습 파일에 쓴다. 첫 화면은 샌드박스 쪽으로 친다.
+static std::string savePath() {
+    int sc = (screen == SC_PICK) ? SC_LEARN : (screen == SC_MENU ? SC_SANDBOX : screen);
+    return savePathFor(sc);
+}
 
 // 만든 칩은 모드와 상관없이 한 곳에 둔다. 학습에서 딴 걸 샌드박스에서도 쓴다.
 static std::string chipsPath() {
@@ -4925,12 +5131,15 @@ static int runTests() {
             "지울 걸 먼저 골라",
             "는 단계에서 받은 부품이라 못 지움", "군데서 쓰는 중이라 못 지움",
             "없어진 부품 개를 되살렸다",
+            "학습", "단계 통과", "난이도", "부 · ", " / 30 · 목록",
+            "누르면 그 단계로 · 통과한 데까지만 갈 수 있다 · Esc 로 첫 화면",
             "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
         };
         // 부품·단계 이름도 다 훑는다
         std::vector<std::string> all;
         for (auto* t : USED) all.push_back(t);
         for (int i = 0; i < TYPE_N; ++i) all.push_back(TYPES[i].name);
+        for (int i = 0; i < PART_N; ++i) { all.push_back(PARTS[i].name); all.push_back(PARTS[i].what); }
         for (int i = 0; i < LESSON_N; ++i) {
             all.push_back(LESSONS[i].title);
             all.push_back(LESSONS[i].text);
@@ -5433,6 +5642,82 @@ static int runTests() {
         screen = SC_SANDBOX; lessonAt = lessonDone = 0; chips.clear(); world = SubSim{};
     }
 
+    // 62. 부가 단계를 빠짐없이 나눠 가진다
+    {
+        bool ok = (PARTS[0].first == 0);
+        char why[160] = "";
+        for (int p = 1; p < PART_N && ok; ++p)
+            if (PARTS[p].first <= PARTS[p-1].first) {
+                ok = false; std::snprintf(why, sizeof(why), "%d부 시작이 뒤로 안 간다", p+1);
+            }
+        for (int p = 0; p < PART_N && ok; ++p) {
+            if (partEnd(p) <= PARTS[p].first) {
+                ok = false; std::snprintf(why, sizeof(why), "%d부가 비었다", p+1);
+            }
+            if (PARTS[p].diff < 1 || PARTS[p].diff > DIFF_MAX) {
+                ok = false; std::snprintf(why, sizeof(why), "%d부 난이도가 범위 밖", p+1);
+            }
+        }
+        // 단계마다 부가 딱 하나여야 한다
+        for (int i = 0; i < LESSON_N && ok; ++i) {
+            int p = partOf(i);
+            if (i < PARTS[p].first || i >= partEnd(p)) {
+                ok = false; std::snprintf(why, sizeof(why), "%d단계가 엉뚱한 부", i+1);
+            }
+        }
+        if (ok && partEnd(PART_N - 1) != LESSON_N) {
+            ok = false; std::snprintf(why, sizeof(why), "마지막 부가 %d단계에서 끝난다", partEnd(PART_N-1));
+        }
+        if (ok) std::snprintf(buf, sizeof(buf), "%d부가 %d단계를 나눠 가짐 (난이도 %d~%d)",
+                              PART_N, LESSON_N, PARTS[0].diff, PARTS[PART_N-1].diff);
+        else    std::snprintf(buf, sizeof(buf), "%s", why);
+        check("부가 단계를 빠짐없이 나눈다", ok, buf);
+    }
+
+    // 63. 단계 목록에서 누른 자리와 그린 자리가 같다
+    {
+        int ow = WIN_W, oh = WIN_H; float os = uiScale;
+        bool ok = true; char why[200] = "";
+        const int SZ[3][2] = { { WIN_W_MIN, WIN_H_MIN }, { 1400, 880 }, { 1920, 1200 } };
+        int seen = 0;
+        for (float sc : { 0.8f, 1.0f, 2.2f }) {
+            uiScale = sc; applyUiScale();
+            for (auto& z : SZ) {
+                WIN_W = z[0]; WIN_H = z[1];
+                pickScroll = 0;
+                // 목록을 굴려 가며 모든 단계가 한 번은 제자리에서 잡히는지 본다
+                for (int at = 0; at < LESSON_N && ok; ++at) {
+                    pickScrollTo(at);
+                    int y = pickTop() + pickRowY(at) - pickScroll;
+                    if (y < pickTop() || y + pickLesH() > pickBot()) continue;   // 안 보이는 건 넘긴다
+                    // 줄의 위·가운데·아래를 다 눌러 본다 (한 점만 보면 어긋나도 지나간다)
+                    for (int dy : { 1, pickLesH()/2, pickLesH() - 1 }) {
+                        int got = pickHit(pickColX() + S(60), y + dy);
+                        ++seen;
+                        if (got != at) {
+                            ok = false;
+                            std::snprintf(why, sizeof(why),
+                                          "배율 %.1f %dx%d 에서 %d단계 줄의 %d번째 점을 누르니 %d 이 잡힘",
+                                          sc, z[0], z[1], at + 1, dy, got + 1);
+                            break;
+                        }
+                    }
+                }
+                // 목록 밖은 안 잡혀야 한다
+                if (ok && pickHit(pickColX() - S(20), pickTop() + S(4)) != -1) {
+                    ok = false; std::snprintf(why, sizeof(why), "칸 왼쪽 바깥이 잡힌다");
+                }
+                if (ok && pickHit(pickColX() + S(60), pickBot() + S(6)) != -1) {
+                    ok = false; std::snprintf(why, sizeof(why), "도움말 자리가 잡힌다");
+                }
+            }
+        }
+        uiScale = os; applyUiScale(); WIN_W = ow; WIN_H = oh; pickScroll = 0;
+        if (ok) std::snprintf(buf, sizeof(buf), "배율 셋 × 크기 셋에서 %d 자리 다 맞음", seen);
+        else    std::snprintf(buf, sizeof(buf), "%s", why);
+        check("단계 목록의 누른 자리가 맞는다", ok, buf);
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -5451,6 +5736,20 @@ static bool anyPaint(SDL_Renderer* ren, int x, int y, int w, int h, uint32_t bg)
     for (int i = 0; i < w * h; ++i) {
         uint32_t c = ((uint32_t)px[i*4+2] << 16) | ((uint32_t)px[i*4+1] << 8) | px[i*4+0];
         if (c != bg) return true;
+    }
+    return false;
+}
+
+// 그 자리에 이 빛깔이 한 점이라도 있나 (표시가 진짜 그려졌는지 보려고)
+static bool hasColor(SDL_Renderer* ren, int x, int y, int w, int h, uint32_t want) {
+    if (w <= 0 || h <= 0) return false;
+    std::vector<uint8_t> px((size_t)w * h * 4);
+    SDL_Rect r{ x, y, w, h };
+    if (SDL_RenderReadPixels(ren, &r, SDL_PIXELFORMAT_ARGB8888, px.data(), w * 4) != 0)
+        return true;                       // 못 읽으면 넘어간다
+    for (int i = 0; i < w * h; ++i) {
+        uint32_t c = ((uint32_t)px[i*4+2] << 16) | ((uint32_t)px[i*4+1] << 8) | px[i*4+0];
+        if (c == want) return true;
     }
     return false;
 }
@@ -5649,6 +5948,12 @@ int main(int argc, char** argv) {
         }
         prev = takeSnap();
         dirty = false;
+    };
+    // 학습을 고르면 단계 목록부터 — 저장본을 읽어야 진도를 안다
+    auto openPick = [&] {
+        if (screen != SC_LEARN) enterMode(SC_LEARN);
+        pickScrollTo(lessonAt);
+        screen = SC_PICK;
     };
     auto leaveToMenu = [&] {
         while (!editStack.empty()) endEdit();      // 고치던 칩은 마무리하고 나간다
@@ -5929,17 +6234,22 @@ int main(int argc, char** argv) {
                 --shotWait;
             } else {
                 static const char* NAMES[] = {
-                    "셈틀-첫화면.ppm", "셈틀-학습.ppm", "셈틀-샌드박스.ppm",
-                    "셈틀-부품.ppm", "셈틀-고치기.ppm"
+                    "셈틀-첫화면.ppm", "셈틀-단계목록.ppm", "셈틀-학습.ppm",
+                    "셈틀-샌드박스.ppm", "셈틀-부품.ppm", "셈틀-고치기.ppm"
                 };
                 if (shotAt > 0) writePPM(ren, NAMES[shotAt - 1]);
-                if (shotAt >= 5) { running = false; }
+                if (shotAt >= 6) { running = false; }
                 else {
                     // 다음 장면 차리기
                     editStack.clear(); dropHandles(); hintOn = false; uiOn = true;
                     if (shotAt == 0) {                       // 1) 첫 화면
                         screen = SC_MENU;
-                    } else if (shotAt == 1) {                // 2) 학습 — XOR 단계 풀어 놓은 모습
+                    } else if (shotAt == 1) {                // 2) 단계 목록
+                        screen = SC_PICK; chips.clear();
+                        lessonDone = lessonByTitle("여덟 칸 기억");
+                        lessonAt = lessonDone;
+                        pickScrollTo(lessonAt);
+                    } else if (shotAt == 2) {                // 3) 학습 — XOR 단계 풀어 놓은 모습
                         screen = SC_LEARN; chips.clear();
                         lessonAt = lessonByTitle("XOR — 다를"); lessonDone = lessonAt;
                         setupLesson(lessonAt);
@@ -5954,11 +6264,11 @@ int main(int argc, char** argv) {
                         }
                         hintOn = true;
                         fitView();
-                    } else if (shotAt == 2) {                // 3) 샌드박스 — 진짜 저장본
+                    } else if (shotAt == 3) {                // 4) 샌드박스 — 진짜 저장본
                         screen = SC_SANDBOX;
                         if (!loadState()) { world = SubSim{}; seedDemo(); }
                         fitView();
-                    } else if (shotAt == 3) {                // 4) 새 부품들
+                    } else if (shotAt == 4) {                // 5) 새 부품들
                         screen = SC_SANDBOX; world = SubSim{}; chips.clear();
                         int ck = addComp(world, CLOCK, 80, 260); world.comps[ck].aux = 3;
                         int bu = addComp(world, BUNDLE, 300, 120);
@@ -5993,7 +6303,7 @@ int main(int argc, char** argv) {
                         }
                         addWire(world, ck, 0, ram, 3);
                         fitView();
-                    } else {                                 // 5) 칩 고치는 중
+                    } else {                                 // 6) 칩 고치는 중
                         screen = SC_SANDBOX;
                         if (!loadState()) { world = SubSim{}; seedDemo(); }
                         int target = -1;
@@ -6088,6 +6398,39 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // ── 단계 목록이면 고르는 것만 받는다 ──
+            if (screen == SC_PICK) {
+                if (e.type == SDL_QUIT) running = false;
+                else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    WIN_W = std::max(WIN_W_MIN, e.window.data1);
+                    WIN_H = std::max(WIN_H_MIN, e.window.data2);
+                    pickScroll = std::clamp(pickScroll, 0, pickMaxScroll());
+                }
+                else if (e.type == SDL_MOUSEMOTION) { mx = e.motion.x; my = e.motion.y; }
+                else if (e.type == SDL_MOUSEWHEEL) {
+                    pickScroll = std::clamp(pickScroll - e.wheel.y * S(48), 0, pickMaxScroll());
+                }
+                else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                    int at = pickHit(e.button.x, e.button.y);
+                    if (at >= 0 && at <= lessonDone) {
+                        screen = SC_LEARN;
+                        if (at != lessonAt) gotoLesson(at);      // 지금 단계면 판을 안 건드린다
+                    }
+                } else if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_ESCAPE) leaveToMenu();
+                    else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) screen = SC_LEARN;
+                    else if (k == SDLK_UP)   pickScroll = std::clamp(pickScroll - S(48), 0, pickMaxScroll());
+                    else if (k == SDLK_DOWN) pickScroll = std::clamp(pickScroll + S(48), 0, pickMaxScroll());
+                    else if (k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {
+                        uiScale += (k == SDLK_RIGHTBRACKET) ? 0.1f : -0.1f;
+                        applyUiScale();
+                        pickScroll = std::clamp(pickScroll, 0, pickMaxScroll());
+                    }
+                }
+                continue;
+            }
+
             // ── 첫 화면이면 고르는 것만 받는다 ──
             if (screen == SC_MENU) {
                 if (e.type == SDL_QUIT) running = false;
@@ -6097,11 +6440,11 @@ int main(int argc, char** argv) {
                 }
                 else if (e.type == SDL_MOUSEMOTION) { mx = e.motion.x; my = e.motion.y; }
                 else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
-                    if (menuBtn(0).has(e.button.x, e.button.y)) enterMode(SC_LEARN);
+                    if (menuBtn(0).has(e.button.x, e.button.y)) openPick();
                     if (menuBtn(1).has(e.button.x, e.button.y)) enterMode(SC_SANDBOX);
                 } else if (e.type == SDL_KEYDOWN) {
                     SDL_Keycode k = e.key.keysym.sym;
-                    if (k == SDLK_1) enterMode(SC_LEARN);
+                    if (k == SDLK_1) openPick();
                     if (k == SDLK_2) enterMode(SC_SANDBOX);
                     if (k == SDLK_ESCAPE) running = false;
                     if (k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {
@@ -6219,6 +6562,9 @@ int main(int argc, char** argv) {
                             if (btnHint().has(mx, my))    hintOn = !hintOn;
                             if (btnPrevLes().has(mx, my)) gotoLesson(lessonAt - 1);
                             if (btnNextLes().has(mx, my)) gotoLesson(lessonAt + 1);
+                            // 머리말을 누르면 단계 목록
+                            int hts = lessonFit(LESSONS[std::clamp(lessonAt, 0, LESSON_N-1)], WIN_H).ts;
+                            if (lesHdrLv(hts) && lesHdr(hts).has(mx, my)) openPick();
                         }
                         break;
                     }
@@ -6500,6 +6846,9 @@ int main(int argc, char** argv) {
             if (smokeLeft == 24) uiOn = false;                  // 판 숨긴 채로
             if (smokeLeft == 20) uiOn = true;
             if (smokeLeft == 18) screen = SC_MENU;               // 첫 화면
+            if (smokeLeft == 16) {                               // 단계 목록
+                screen = SC_PICK; lessonDone = 12; lessonAt = 12; pickScrollTo(lessonAt);
+            }
             if (smokeLeft == 14) { screen = SC_LEARN; setupLesson(0); }
             if (smokeLeft == 10) doGrade();                      // 못 푼 채로 채점
             if (smokeLeft == 6)  { lessonDone = LESSON_N; lessonAt = LESSON_N - 1;
@@ -6510,6 +6859,22 @@ int main(int argc, char** argv) {
         }
 
         // ── 그리기 ──
+        if (screen == SC_PICK) {
+            drawPick(ren, mx, my);
+            // 목록이 통째로 비는 일이 없게 — 지금 단계 표시가 실제로 찍혔나 본다
+            if (smoke) {
+                int ry = pickTop() + pickRowY(lessonAt) - pickScroll;
+                if (ry >= pickTop() && ry + pickLesH() <= pickBot() &&
+                    !hasColor(ren, pickColX(), ry, pickColW(), pickLesH(), 0x5A86BA)) {
+                    std::fprintf(stderr, "단계 목록에 지금 단계가 안 보인다\n");
+                    smokeBad = true;
+                }
+            }
+            shotStep();
+            SDL_RenderPresent(ren);
+            ++frame;
+            continue;
+        }
         if (screen == SC_MENU) {
             int hov = -1;
             for (int i = 0; i < 2; ++i) if (menuBtn(i).has(mx, my)) hov = i;
