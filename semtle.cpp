@@ -75,7 +75,7 @@ static const int PORT_HIT = 11;   // 포트 잡히는 반경
 
 enum Type { SWITCH, LAMP, PIN_IN, PIN_OUT,
             T_AND, T_OR, T_NOT, T_XOR, T_NAND, T_NOR,
-            CLOCK, BUNDLE, SPLIT, RAM, TYPE_N };
+            CLOCK, BUNDLE, SPLIT, RAM, SWBANK, SCREEN, TYPE_N };
 
 struct TypeInfo { const char* name; int nIn; int nOut; uint32_t color; };
 
@@ -94,14 +94,20 @@ static const TypeInfo TYPES[TYPE_N] = {
     /* BUNDLE  */ { "묶음",   2, 1, 0x4E7E7E },   // 가는 선 여럿 → 굵은 선 하나
     /* SPLIT   */ { "풀음",   1, 2, 0x4E7E7E },   // 굵은 선 하나 → 가는 선 여럿
     /* RAM     */ { "램",     4, 1, 0x8A4E7E },   // 주소·데이터·쓰기·클럭 → 데이터
+    /* SWBANK  */ { "스위치묶음", 0, 1, 0x2E7D5B }, // 스위치 n개를 한 값으로
+    /* SCREEN  */ { "화면",   1, 0, 0x3E5A6E },   // n개의 m비트를 점 격자로
 };
 
 // 칩의 포트가 되는 부품
 static inline bool isPin(int type) { return type == PIN_IN || type == PIN_OUT; }
 // 폭을 사람이 정할 수 있는 부품 (aux 에 폭이 들어간다)
 static inline bool hasWidth(int type) {
-    return isPin(type) || type == BUNDLE || type == SPLIT;
+    return isPin(type) || type == BUNDLE || type == SPLIT || type == SWBANK || type == SCREEN;
 }
+
+// 화면 크기: aux 아랫자리는 비트 폭(m), 그 위 자리는 줄 수(n)
+static const int SCR_ROWS_SHIFT = 12;      // aux 의 이 자리부터 줄 수
+static const int SCR_MAX = 16;
 
 // 램 크기
 static const int RAM_WORDS = 256;
@@ -192,12 +198,19 @@ static bool canFold(const Comp& c) {
 static bool isFolded(const Comp& c) {
     return canFold(c) && (c.aux & FOLD_BIT);
 }
+// 화면이 받는 줄 수 (n). 폭(m)은 widthOf 가 준다.
+static int screenRows(const Comp& c) {
+    if (c.type != SCREEN) return 1;
+    int r = (c.aux >> SCR_ROWS_SHIFT) & 0x1F;
+    return std::clamp(r <= 0 ? 8 : r, 1, SCR_MAX);
+}
 
 // 입력·출력 포트 수
 static int nIn(const Comp& c)  {
     if (c.chipId >= 0) return (int)chips[c.chipId].tmpl.inPorts.size();
     if (c.type == BUNDLE) return widthOf(c);      // 가는 선 폭만큼 받는다
     if (c.type == SPLIT)  return 1;
+    if (c.type == SCREEN) return screenRows(c);   // 줄마다 하나씩 받는다
     return TYPES[c.type].nIn;
 }
 static int nOut(const Comp& c) {
@@ -220,6 +233,7 @@ static int inWidth(const Comp& c, int port) {
     if (c.type == PIN_OUT) return widthOf(c);
     if (c.type == SPLIT)   return widthOf(c);     // 굵은 선을 받는다
     if (c.type == BUNDLE)  return 1;              // 가는 선들을 받는다
+    if (c.type == SCREEN)  return widthOf(c);     // 줄 하나가 m비트
     if (c.type == RAM)     return (port == 0) ? RAM_ADDRW : (port == 1) ? RAM_DATAW : 1;
     return 1;
 }
@@ -233,6 +247,7 @@ static int outWidth(const Comp& c, int port) {
         return 1;
     }
     if (c.type == PIN_IN)  return widthOf(c);
+    if (c.type == SWBANK)  return widthOf(c);     // 스위치 n개를 한 값으로
     if (c.type == BUNDLE)  return widthOf(c);     // 굵은 선을 내보낸다
     if (c.type == SPLIT)   return 1;
     if (c.type == RAM)     return RAM_DATAW;
@@ -277,7 +292,11 @@ static uint32_t compColor(const Comp& c) {
 
 static int addComp(SubSim& s, int type, int x, int y) {
     Comp c; c.type = type; c.chipId = -1; c.x = x; c.y = y;
-    if (hasWidth(type)) c.aux = (type == BUNDLE || type == SPLIT) ? 8 : 1;
+    if (hasWidth(type)) {
+        if (type == BUNDLE || type == SPLIT || type == SWBANK) c.aux = 8;
+        else if (type == SCREEN) c.aux = 8 | (8 << SCR_ROWS_SHIFT);   // 8줄 × 8칸
+        else c.aux = 1;
+    }
     resizePorts(c);
     // 핀은 이름이 있어야 뜻이 있다. 없으면 안 겹치게 번호를 붙여 준다.
     if (isPin(type)) {
@@ -388,8 +407,10 @@ static void tickSub(SubSim& s) {
             switch (c.type) {
                 // 스위치와 입력핀은 밖에서 정해 준 값을 그대로 들고 있는다
                 case SWITCH:
+                case SWBANK:
                 case PIN_IN: if (!c.nextOut.empty()) c.nextOut[0] = c.out.empty() ? 0 : c.out[0]; break;
                 case LAMP:
+                case SCREEN:
                 case PIN_OUT: break;                                   // 켜짐 = in[0]
                 case T_NOT:  c.nextOut[0] = !a;         break;
                 case T_AND:  c.nextOut[0] = a && b;     break;
@@ -881,9 +902,13 @@ static void zoomAt(float nz, int sx, int sy) {
 
 // 안 돌린 상태의 크기
 static int baseW(const Comp& c) {
+    if (c.type == SCREEN) return std::max(GW_MIN, widthOf(c) * 14 + 20);
+    if (c.type == SWBANK) return std::max(GW_MIN, 64);
     return std::max(GW_MIN, textWidth(15, compName(c)) + 26);
 }
 static int baseH(const Comp& c) {
+    if (c.type == SCREEN) return std::max(48, screenRows(c) * 14 + 28);
+    if (c.type == SWBANK) return std::max(48, widthOf(c) * 20 + 24);
     if (isFolded(c)) return 52;          // 접으면 게이트만 한 크기
     return std::max(48, std::max(nIn(c), nOut(c)) * 20 + 12);
 }
@@ -1116,6 +1141,20 @@ static bool inPortAt(int mx, int my, int& comp, int& port) {
     }
     return false;
 }
+// 스위치묶음에서 누른 비트 자리 (없으면 -1)
+static int swBankBitAt(const Comp& c, int wx2, int wy2) {
+    if (c.type != SWBANK) return -1;
+    int w = compW(c), h = compH(c);
+    if (wx2 < c.x || wx2 >= c.x + w || wy2 < c.y || wy2 >= c.y + h) return -1;
+    int wd = widthOf(c), pad = 4;
+    int rowH = (h - 20 - pad) / std::max(1, wd);
+    if (rowH <= 0) return -1;
+    int fromBottom = (c.y + h - 20) - wy2;
+    if (fromBottom < 0) return -1;
+    int i = fromBottom / rowH;
+    return (i >= 0 && i < wd) ? i : -1;
+}
+
 static int compAt(int mx, int my) {
     for (int i = (int)world.comps.size() - 1; i >= 0; --i) {
         if (!world.comps[i].alive) continue;
@@ -1176,7 +1215,7 @@ static bool uiOn = true;      // 좌우 판을 보여 줄까 (Tab)
 
 // 과정을 고치면(단계를 쪼개거나 순서를 바꾸면) 저장된 진도가 엉뚱한 단계를 가리킨다.
 // 이 번호를 올려 두면 진도만 처음으로 되돌리고, 얻어 둔 칩은 그대로 둔다.
-static const int COURSE_VER = 3;
+static const int COURSE_VER = 4;
 
 // 기억하는 회로는 진리표로 못 잰다. 값을 차례로 넣어 보며 그때그때 확인해야 한다.
 // 한 칸이 "이 값들을 넣고 몇 틱 돌린 뒤, 이 출력이 이 값이어야 한다" 를 뜻한다.
@@ -1344,6 +1383,29 @@ static const Step CPU_SCRIPT[] = {
     { {1,0}, {42}, 1, 0, "셋째는 멈춤이라 안 바뀐다" },
     { {0,0}, {42}, 1, 0, "42 그대로" },
     { {1,0}, {42}, 1, 0, "계속 멈춰 있어야 한다" },
+};
+
+// 스위치묶음으로 값 만들기
+static const Step SWB_SCRIPT[] = {
+    { {0}, {181}, 1, 0, "스위치묶음을 181 로 맞춰 출력핀에 이어라" },
+};
+
+// 화면에 줄을 켜 보기
+static const Step SCR_SCRIPT[] = {
+    { {255, 0},  {255}, 1, 0, "윗줄을 다 켠다" },
+    { {255, 15}, {255}, 1, 0, "가운뎃줄은 절반만" },
+};
+
+// 글자 찍기: 주소를 주면 그 줄의 그림을 내놓는 회로
+// 램에 미리 넣어 둘 그림 (8줄, 각 줄이 8칸). 'ㄱ' 비슷한 모양.
+static const Val GLYPH_PROG[] = {
+    0xFE, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+};
+static const Step GLYPH_SCRIPT[] = {
+    { {0}, {0xFE}, 1, 0, "0번 줄" },
+    { {1}, {0x02}, 1, 0, "1번 줄" },
+    { {4}, {0x02}, 1, 0, "4번 줄" },
+    { {7}, {0x02}, 1, 0, "7번 줄" },
 };
 
 static const Lesson LESSONS[] = {
@@ -1628,6 +1690,40 @@ static const Lesson LESSONS[] = {
       {}, "", true,
       "세는상자 → 램 주소 (6비트만 쓰면 된다)\n램 출력을 풀어서 윗 2비트 → 해독기,\n아랫 6비트 → 묶음 → 누산기의 값\n해독기의 '불러오기 또는 더하기' 를 누산기 클럭으로,\n'더하기' 를 누산기의 더할까로.",
       { 1, 1 }, { 8 }, CPU_SCRIPT, 10, CPU_PROG, 3 },
+
+    // ── 10부. 보고 넣기 ──
+    { "", "28. 눌러서 넣기",
+      "8비트 값을 스위치 여덟으로 만드는 건 번거롭다.\n\n"
+      "**스위치묶음** 은 그 여덟을 한 부품으로 묶은 것이다.\n"
+      "칸을 눌러 비트를 켜고 끄면 아래에 값이 뜬다.\n\n"
+      "스위치묶음 하나를 놓고 181 을 만들어\n"
+      "출력핀으로 내보내 보자.",
+      1, 1, { "안씀" }, { "값" },
+      {}, "스위치묶음", false,
+      "스위치묶음을 놓고 폭이 8인지 본다(W 로 바꿈).\n181 = 10110101 이다.\n맨 아래 칸이 1의 자리.",
+      {}, { 8 }, SWB_SCRIPT, 1, nullptr, 0 },
+
+    { "", "29. 화면에 찍기",
+      "**화면** 은 n개의 m비트 입력을 n줄 × m칸 점으로 보여 준다.\n"
+      "입력 하나가 한 줄이고, 비트 하나가 점 하나다.\n"
+      "왼쪽이 윗자리다.\n\n"
+      "E 로 줄 수를, W 로 칸 수를 바꾼다.\n\n"
+      "8줄짜리 화면에 아무 줄이나 켜 보자 —\n"
+      "0번 줄이 전부 켜지고 3번 줄이 절반이면 통과다.",
+      2, 1, { "윗줄", "가운뎃줄" }, { "확인" },
+      {}, "화면 스위치묶음", false,
+      "화면을 놓고 E 로 8줄, W 로 8칸.\n윗줄을 0번 입력에, 가운뎃줄을 3번 입력에 잇는다.\n확인 출력핀에는 윗줄을 그대로 이으면 된다.",
+      { 8, 8 }, { 8 }, SCR_SCRIPT, 2, nullptr, 0 },
+
+    { "글자찍개", "30. 램으로 그림 그리기",
+      "램에 그림을 한 줄씩 담아 두면 화면에 찍을 수 있다.\n\n"
+      "줄 번호를 주소로 넣으면 그 줄의 그림이 나온다.\n"
+      "그게 곧 화면 한 줄이다.\n\n"
+      "채점할 때 램에 그림이 들어간다. 넣지 않아도 된다.",
+      1, 1, { "줄번호" }, { "그림" },
+      {}, "", true,
+      "램의 주소에 줄번호를 잇고,\n램이 내놓는 값을 그림으로 그대로 내보낸다.\n주소는 8비트라 묶음으로 폭을 맞춰야 할 수도 있다.",
+      { 8 }, { 8 }, GLYPH_SCRIPT, 4, GLYPH_PROG, 8 },
 };
 
 static const int LESSON_N = (int)(sizeof(LESSONS) / sizeof(LESSONS[0]));
@@ -2202,6 +2298,51 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
             drawTextC(ren, cx, box.y + box.h/2 + w2sLen(4), std::max(7, (int)(11 * viewZoom)),
                       0xE0C0E8, b2);
         }
+    } else if (c.type == SWBANK) {
+        // 겉모습이 스위치 n개다. 칸을 눌러 그 비트를 켜고 끈다.
+        fillRect(ren, box, shade(base, -34));
+        frameRect(ren, box, shade(base, 40));
+        int wd = widthOf(c);
+        Val v = c.out.empty() ? 0 : c.out[0];
+        int pad = std::max(2, w2sLen(4));
+        int rowH = (box.h - w2sLen(20) - pad) / std::max(1, wd);
+        for (int i = 0; i < wd; ++i) {
+            bool on = (v >> i) & 1;                     // 0번이 맨 아래
+            Rect r{ box.x + pad, box.y + box.h - w2sLen(20) - (i + 1) * rowH,
+                    box.w - pad * 2, std::max(2, rowH - 1) };
+            fillRect(ren, r, on ? blend(base, COL_ON, 170) : 0x252A30);
+            if (rowH >= w2sLen(9)) {
+                char d[2] = { (char)('0' + (on ? 1 : 0)), 0 };
+                drawTextC(ren, r.x + r.w/2, r.y + (r.h - S(11))/2, 11,
+                          on ? 0x0E140F : 0x6C7280, d);
+            }
+        }
+        char b2[24]; std::snprintf(b2, sizeof(b2), "%d", (int)v);
+        drawTextC(ren, cx, box.y + box.h - w2sLen(18), std::max(8, (int)(12 * viewZoom)),
+                  0xC8E8D0, b2);
+    } else if (c.type == SCREEN) {
+        // n줄 × m칸 점 격자. 입력 하나가 한 줄, 비트 하나가 점 하나.
+        fillRect(ren, box, 0x14181E);
+        frameRect(ren, box, shade(base, 40));
+        int rows = screenRows(c), wd = widthOf(c);
+        int pad = std::max(2, w2sLen(5));
+        int gw = (box.w - pad * 2) / std::max(1, wd);
+        int gh = (box.h - pad * 2 - w2sLen(14)) / std::max(1, rows);
+        int d = std::max(1, std::min(gw, gh) - std::max(1, w2sLen(2)));
+        for (int r = 0; r < rows; ++r) {
+            Val v = (r < (int)c.in.size()) ? c.in[r] : 0;
+            for (int k = 0; k < wd; ++k) {
+                bool on = (v >> (wd - 1 - k)) & 1;      // 왼쪽이 윗자리
+                Rect p2{ box.x + pad + k * gw + (gw - d) / 2,
+                         box.y + pad + r * gh + (gh - d) / 2, d, d };
+                fillRect(ren, p2, on ? 0x7ADCA0 : 0x232A32);
+            }
+        }
+        if (viewZoom > 0.5f) {
+            char b2[24]; std::snprintf(b2, sizeof(b2), "%d×%d", rows, wd);
+            drawTextC(ren, cx, box.y + box.h - w2sLen(13), std::max(7, (int)(10 * viewZoom)),
+                      0x6E8494, b2);
+        }
     } else if (c.type == BUNDLE || c.type == SPLIT) {
         bool fold = isFolded(c);
         fillRect(ren, box, shade(base, fold ? -24 : -14));
@@ -2508,7 +2649,9 @@ static bool readSub(std::FILE* f, SubSim& s) {
         c.x = x; c.y = y; c.rot = rot & 3; c.alive = alive != 0;
         c.label = lab;
         if (chipId < 0 && hasWidth(type)) {
-            c.aux = std::clamp(aux & 0xFF, 1, WIDTH_MAX) | (aux & FOLD_BIT);
+            // 아랫자리 = 폭, 0x100 = 접힘, 윗자리 = 화면 줄 수
+            c.aux = std::clamp(aux & 0xFF, 1, WIDTH_MAX) | (aux & FOLD_BIT)
+                  | (aux & (0x1F << SCR_ROWS_SHIFT));
             resizePorts(c);
         }
         else if (chipId < 0 && type == CLOCK) c.aux = std::clamp(aux, 0, CLOCK_N - 1);
@@ -3886,6 +4029,24 @@ static int runTests() {
                 addWire(world, dec, 2, acc, 2);                // 더할까
                 addWire(world, acc, 0, O0, 0);
             }
+            else if (t.find("눌러서 넣기") != std::string::npos) {     // 스위치묶음
+                int sb = addComp(world, SWBANK, 300, 150);
+                world.comps[sb].out.assign(1, 181);
+                addWire(world, sb, 0, O0, 0);
+            }
+            else if (t.find("화면에 찍기") != std::string::npos) {     // 화면
+                int sc2 = addComp(world, SCREEN, 400, 120);
+                world.comps[sc2].aux = 8 | (8 << SCR_ROWS_SHIFT);
+                resizePorts(world.comps[sc2]);
+                addWire(world, A, 0, sc2, 0);        // 윗줄 → 0번
+                addWire(world, B, 0, sc2, 3);        // 가운뎃줄 → 3번
+                addWire(world, A, 0, O0, 0);         // 확인
+            }
+            else if (t.find("램으로 그림") != std::string::npos) {     // 글자찍개
+                int ram = addComp(world, RAM, 400, 150);
+                addWire(world, A, 0, ram, 0);        // 줄번호 → 주소
+                addWire(world, ram, 0, O0, 0);       // 나온 값 → 그림
+            }
             else {                                                   // 전가산기
                 int hi = chipNamed("반가산기");
                 if (hi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 반가산기 칩이 없다", at+1); broke = true; break; }
@@ -4680,6 +4841,7 @@ static int runTests() {
             "핀 더블클릭=이름 · 가운데버튼=이동 · Ctrl+휠=확대",
             "Tab : 판 다시 보기", "입력핀", "출력핀", "학습 진도  ", "단계",
             "손 도구", "선 고름 — Del 로 지운다", "찾기 (/)", "찾는 게 없다",
+            "줄 수는 화면만 바꾼다 (E)", "화면 ", "줄", "×",
             "접을 수 있는 건 묶음·풀음뿐 (3비트부터)", "개 접음", "개 펼침",
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
             "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · Ctrl+C/V · Del=지우기 · G=묶기",
@@ -5018,6 +5180,91 @@ static int runTests() {
               && ports && centered && w && keptFold && keptW && noSmall, buf);
         std::remove(savePath().c_str());
         std::remove(chipsPath().c_str());
+    }
+
+    // 58. 스위치묶음이 눌린 비트대로 값을 낸다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        int sb = addComp(world, SWBANK, 200, 100);
+        bool w8 = widthOf(world.comps[sb]) == 8 && nOut(world.comps[sb]) == 1
+                  && outWidth(world.comps[sb], 0) == 8 && nIn(world.comps[sb]) == 0;
+        int sp = addComp(world, SPLIT, 500, 100);
+        addWire(world, sb, 0, sp, 0);
+        std::vector<int> lp;
+        for (int i = 0; i < 8; ++i) {
+            int q = addComp(world, LAMP, 700, 40 + i * 40);
+            lp.push_back(q); addWire(world, sp, i, q, 0);
+        }
+        // 비트를 눌러 181 을 만든다 (누른 자리를 찾아 뒤집는 식)
+        int want = 181;
+        for (int i = 0; i < 8; ++i) {
+            Comp& c = world.comps[sb];
+            int w = compW(c), h = compH(c), wd = widthOf(c), pad = 4;
+            int rowH = (h - 20 - pad) / wd;
+            int yy = (c.y + h - 20) - i * rowH - rowH / 2;    // 그 칸 가운데
+            int bit = swBankBitAt(c, c.x + w / 2, yy);
+            if (bit == i && ((want >> i) & 1))
+                c.out[0] = maskTo((Val)(c.out[0] ^ (1u << bit)), wd);
+        }
+        settle();
+        int got = 0; for (int i = 0; i < 8; ++i) if (lit(world.comps[lp[i]])) got |= (1 << i);
+        Val onWire = world.comps[sb].out.empty() ? 0 : world.comps[sb].out[0];
+
+        // 저장했다 열어도 눌린 그대로
+        bool wr = saveState();
+        world = SubSim{}; chips.clear();
+        bool rd = loadState();
+        Val after = (rd && (int)world.comps.size() > sb) ? world.comps[sb].out[0] : 0;
+
+        std::snprintf(buf, sizeof(buf), "폭 8·출력만 %d, 눌러서 %d, 전구 %d, 저장 뒤 %d",
+                      (int)w8, (int)onWire, got, (int)after);
+        check("스위치묶음이 눌린 대로 값을 낸다",
+              w8 && onWire == want && got == want && wr && rd && after == want, buf);
+        std::remove(savePath().c_str()); std::remove(chipsPath().c_str());
+    }
+
+    // 59. 화면이 줄마다 값을 받는다
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear();
+        int sc2 = addComp(world, SCREEN, 300, 100);
+        bool def = (screenRows(world.comps[sc2]) == 8) && (widthOf(world.comps[sc2]) == 8)
+                   && (nIn(world.comps[sc2]) == 8) && (nOut(world.comps[sc2]) == 0)
+                   && inWidth(world.comps[sc2], 0) == 8;
+
+        // 줄 수를 5로 줄이면 포트도 5개
+        world.comps[sc2].aux = (world.comps[sc2].aux & ~(0x1F << SCR_ROWS_SHIFT))
+                             | (5 << SCR_ROWS_SHIFT);
+        resizePorts(world.comps[sc2]);
+        bool five = (nIn(world.comps[sc2]) == 5);
+        // 칸 수를 4로
+        world.comps[sc2].aux = (world.comps[sc2].aux & ~0xFF) | 4;
+        resizePorts(world.comps[sc2]);
+        bool four = (inWidth(world.comps[sc2], 0) == 4);
+        int wSz = compW(world.comps[sc2]), hSz = compH(world.comps[sc2]);
+
+        // 값을 넣어 본다
+        std::vector<int> sb;
+        for (int r = 0; r < 5; ++r) {
+            int q = addComp(world, SWBANK, 60, 40 + r * 90);
+            world.comps[q].aux = 4; resizePorts(world.comps[q]);
+            world.comps[q].out.assign(1, (Val)(r * 3));
+            sb.push_back(q);
+            addWire(world, q, 0, sc2, r);
+        }
+        settle();
+        bool got = true;
+        for (int r = 0; r < 5; ++r)
+            if (world.comps[sc2].in[r] != (Val)(r * 3)) got = false;
+
+        // 16×16 까지 커진다
+        world.comps[sc2].aux = 16 | (16 << SCR_ROWS_SHIFT);
+        resizePorts(world.comps[sc2]);
+        bool big = (nIn(world.comps[sc2]) == 16) && (inWidth(world.comps[sc2], 0) == 16)
+                   && compW(world.comps[sc2]) > wSz && compH(world.comps[sc2]) > hSz;
+
+        std::snprintf(buf, sizeof(buf), "기본 8×8 %d, 5줄 %d·4칸 %d, 줄마다 값 %d, 16×16 %d",
+                      (int)def, (int)five, (int)four, (int)got, (int)big);
+        check("화면이 줄마다 값을 받는다", def && five && four && got && big, buf);
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
@@ -5399,6 +5646,26 @@ int main(int argc, char** argv) {
         say(b2); touch();
     };
 
+    // 화면 줄 수 바꾸기
+    auto doRows = [&](int step) {
+        int n = 0;
+        for (int i : sel) {
+            if (i < 0 || i >= (int)world.comps.size()) continue;
+            Comp& c = world.comps[i];
+            if (!c.alive || c.type != SCREEN) continue;
+            int r = std::clamp(screenRows(c) + step, 1, SCR_MAX);
+            c.aux = (c.aux & ~(0x1F << SCR_ROWS_SHIFT)) | (r << SCR_ROWS_SHIFT);
+            resizePorts(c);
+            for (auto& wr : world.wires)
+                if (wr.alive && wr.to == i && wr.toPort >= nIn(c)) wr.alive = false;
+            ++n;
+        }
+        if (!n) { say("줄 수는 화면만 바꾼다 (E)"); return; }
+        char b2[48];
+        std::snprintf(b2, sizeof(b2), "화면 %d줄", screenRows(world.comps[sel[0]]));
+        say(b2); touch();
+    };
+
     // 폭 바꾸기 — 핀·묶음·풀음만. 폭이 바뀌면 그 포트에 걸린 선은 안 맞으니 끊는다.
     auto doWidth = [&](int step) {
         int changed = 0, cut = 0;
@@ -5494,6 +5761,22 @@ int main(int argc, char** argv) {
                         int ram = addComp(world, RAM, 480, 300);
                         addWire(world, bu, 0, sp, 0);
                         world.comps[sp].aux |= FOLD_BIT;      // 한쪽은 접어 놓고 견줘 본다
+                        // 스위치묶음과 화면도 같이 보여 준다
+                        {
+                            int sb2 = addComp(world, SWBANK, 120, 620);
+                            world.comps[sb2].out.assign(1, 181);
+                            int scr = addComp(world, SCREEN, 700, 640);
+                            world.comps[scr].aux = 4 | (4 << SCR_ROWS_SHIFT);
+                            resizePorts(world.comps[scr]);
+                            static const Val PIC[4] = { 0x6, 0x9, 0x9, 0x6 };
+                            for (int r = 0; r < 4; ++r) {
+                                int q = addComp(world, SWBANK, 400, 560 + r * 150);
+                                world.comps[q].aux = 4; resizePorts(world.comps[q]);
+                                world.comps[q].out.assign(1, PIC[r]);
+                                addWire(world, q, 0, scr, r);
+                            }
+                            addWire(world, sb2, 0, ram, 1);
+                        }
                         for (int i = 0; i < 8; ++i) {
                             int q = addComp(world, SWITCH, 120, 20 + i * 46);
                             addWire(world, q, 0, bu, i);
@@ -5678,6 +5961,7 @@ int main(int argc, char** argv) {
                     else if (ctrl && k == SDLK_y)  doRedo();
                     else if (ctrl && k == SDLK_s)  doExport();
                     else if (ctrl && k == SDLK_o)  doImport();
+                    else if (k == SDLK_e)          doRows(shift ? -1 : 1);
                     else if (k == SDLK_q)          doFold(-1);
                     else if (k == SDLK_w)          doWidth(shift ? -1 : 1);
                     else if (k == SDLK_COMMA)      doClockSpeed(-1);
@@ -5937,6 +6221,15 @@ int main(int argc, char** argv) {
                             if (!dragMoved && (t == SWITCH || t == PIN_IN)) {
                                 auto& o = world.comps[dragComp].out;
                                 if (!o.empty()) { o[0] = !o[0]; flipped = true; }
+                            }
+                            // 스위치묶음은 누른 칸의 비트만 뒤집는다
+                            if (!dragMoved && t == SWBANK) {
+                                Comp& c = world.comps[dragComp];
+                                int bit = swBankBitAt(c, wx, wy);
+                                if (bit >= 0 && !c.out.empty()) {
+                                    c.out[0] = maskTo((Val)(c.out[0] ^ (1u << bit)), widthOf(c));
+                                    flipped = true;
+                                }
                             }
                             if (dragMoved) touch();        // 옮긴 건 되돌릴 수 있어야 한다
                             else if (flipped) touchRun();  // 껐다 켠 건 저장만
