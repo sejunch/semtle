@@ -2278,6 +2278,7 @@ static const KeyRow KEYS_R[] = {
     { "- · =",        "확대·축소" },
     { "F",            "다 보이게 맞추기" },
     { "0",            "100% 로" },
+    { "스페이스",     "판 처음 자리(0,0)로" },
     { "가운데 끌기",  "화면 옮기기" },
     { "Tab",          "좌우 판 숨기기" },
     { "[ · ]",        "글자 크기" },
@@ -5279,6 +5280,7 @@ static int runTests() {
             "끌어서 고르기(Shift 로 더하기) · Del=지우기 · ?=조작키",
             "넣음 · ", "뺌 · ", "개 고름",
             "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
+            "판 처음 자리",
             "지울 걸 먼저 골라",
             "는 단계에서 받은 부품이라 못 지움", "군데서 쓰는 중이라 못 지움",
             "없어진 부품 개를 되살렸다",
@@ -6717,6 +6719,7 @@ int main(int argc, char** argv) {
                     else if (k == SDLK_EQUALS || k == SDLK_KP_PLUS)
                         zoomAt(viewZoom * 1.25f, (canvasL() + canvasR())/2, WIN_H/2);
                     else if (k == SDLK_0)          { viewZoom = 1.0f; }
+                    else if (k == SDLK_SPACE)      { viewX = viewY = 0; say("판 처음 자리"); }
                     else if (k == SDLK_f)          fitView();
                     else if (k >= SDLK_1 && k <= SDLK_9) {
                         int t = k - SDLK_1 + 1;
