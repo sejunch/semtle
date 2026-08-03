@@ -318,6 +318,9 @@ static int addComp(SubSim& s, int type, int x, int y) {
 static SubSim deepCopy(const SubSim& s);   // 앞선언
 
 static int addChip(SubSim& s, int chipId, int x, int y) {
+    // 없는 칩이면 아무것도 안 놓는다. -1 을 받은 addWire 는 그냥 넘어가니
+    // 부르는 쪽이 매번 확인 안 해도 터지진 않는다.
+    if (chipId < 0 || chipId >= (int)chips.size() || !chips[chipId].alive) return -1;
     Comp c; c.type = -1; c.chipId = chipId; c.x = x; c.y = y;
     c.sub = std::make_shared<SubSim>(deepCopy(chips[chipId].tmpl));
     resizePorts(c);
@@ -3348,6 +3351,30 @@ static bool buildSolution(int at, char* err, size_t errN) {
     return true;
 }
 
+// 통과했던 단계의 칩이 없어졌으면 다시 만들어 준다.
+// 학습에서 상품으로 받은 칩을 지우고 저장하면 뒷 단계가 영영 안 풀린다.
+// 판은 건드리지 않는다.
+static int repairLessonChips() {
+    SubSim keepWorld = deepCopy(world);
+    int keepAt = lessonAt;
+    int fixed = 0;
+    for (int i = 0; i < LESSON_N && i < lessonDone; ++i) {
+        const Lesson& L = LESSONS[i];
+        if (!L.bank || !L.name || !*L.name) continue;
+        bool have = false;
+        for (const auto& c : chips) if (c.alive && c.name == L.name) have = true;
+        if (have) continue;
+        lessonAt = i;
+        setupLesson(i);
+        char err[200] = "";
+        if (buildSolution(i, err, sizeof(err))) { bankLesson(L); ++fixed; }
+        else std::fprintf(stderr, "%d단계 칩을 못 되살림: %s\n", i + 1, err);
+    }
+    world = std::move(keepWorld);
+    lessonAt = keepAt;
+    return fixed;
+}
+
 static int runTests() {
     char buf[256];
     // 검사가 진짜 저장 파일을 건드리면 안 된다. 따로 지정 안 했으면 임시 파일로.
@@ -4894,6 +4921,8 @@ static int runTests() {
             "넣음 · ", "뺌 · ", "개 고름",
             "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
             "지울 걸 먼저 골라",
+            "는 단계에서 받은 부품이라 못 지움", "군데서 쓰는 중이라 못 지움",
+            "없어진 부품 개를 되살렸다",
             "ON", "OFF", "·", "램", "비트", "틱", "→", "入", "出", "—", "¼", "½",
         };
         // 부품·단계 이름도 다 훑는다
@@ -5354,6 +5383,54 @@ static int runTests() {
               oneBitPlain && eightIsBank && taller && got == want && plainWorks, buf);
     }
 
+    // 61. 상품 칩을 지워도 되살아난다 (지우고 저장하면 못 깨던 상황)
+    {
+        screen = SC_LEARN; world = SubSim{}; chips.clear(); editStack.clear();
+        // 플립플롭까지 실제로 풀어서 칩을 모은다.
+        // 플립플롭은 아직 아무 칩도 안 쓰고 있어서 지울 수 있다 —
+        // 실제로 막혔던 상황이 이거다.
+        int upto = lessonByName("플립플롭") + 1;
+        char why[200] = "";
+        for (int i = 0; i < upto; ++i) {
+            lessonAt = i; setupLesson(i);
+            if (!buildSolution(i, why, sizeof(why))) { std::snprintf(buf, sizeof(buf), "%s", why); break; }
+            bankLesson(LESSONS[i]);
+        }
+        lessonDone = upto;
+        int before = 0; for (auto& c : chips) if (c.alive) ++before;
+
+        // 방금 받은 플립플롭을 지운다 — 다음 단계(레지스터)가 이걸 쓴다
+        int victim = -1;
+        for (int i = 0; i < (int)chips.size(); ++i)
+            if (chips[i].alive && chips[i].name == "플립플롭") victim = i;
+        world = SubSim{};                        // 판을 비워 쓰는 데가 없게
+        bool wiped = (victim >= 0) && deleteChip(victim);
+        int afterDel = 0; for (auto& c : chips) if (c.alive) ++afterDel;
+
+        // 이 상태로는 다음 단계(레지스터)를 못 푼다
+        int next = lessonByName("레지스터");
+        lessonAt = next; setupLesson(next);
+        char err[200] = "";
+        bool stuck = !buildSolution(next, err, sizeof(err));
+
+        // 되살리기
+        int fixed = repairLessonChips();
+        int afterFix = 0; for (auto& c : chips) if (c.alive) ++afterFix;
+        bool backAgain = false;
+        for (auto& c : chips) if (c.alive && c.name == "AND짜기") backAgain = true;
+
+        // 이제 다시 풀린다
+        lessonAt = next; setupLesson(next);
+        bool solves = buildSolution(next, err, sizeof(err))
+                   && gradeLesson(LESSONS[next], err, sizeof(err));
+
+        std::snprintf(buf, sizeof(buf), "칩 %d개 → 지우니 %d개(막힘 %d) → 되살리니 %d개, 돌아옴 %d, 다시 풀림 %d",
+                      before, afterDel, (int)stuck, afterFix, (int)backAgain, (int)solves);
+        check("지운 상품 칩이 되살아난다",
+              wiped && stuck && fixed == 1 && backAgain && solves && afterFix == before, buf);
+        screen = SC_SANDBOX; lessonAt = lessonDone = 0; chips.clear(); world = SubSim{};
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -5559,6 +5636,15 @@ int main(int argc, char** argv) {
         } else if (sc == SC_LEARN && world.comps.empty()) {
             setupLesson(lessonAt);
         }
+        if (sc == SC_LEARN) {
+            int fixed = repairLessonChips();      // 지워 버린 상품 칩을 되살린다
+            if (fixed) {
+                char b2[64];
+                std::snprintf(b2, sizeof(b2), "없어진 부품 %d개를 되살렸다", fixed);
+                say(b2);
+                dirty = true; dirtyAt = frame;
+            }
+        }
         prev = takeSnap();
         dirty = false;
     };
@@ -5591,6 +5677,14 @@ int main(int argc, char** argv) {
         saveState();
         lessonAt = at;
         setupLesson(at);
+        {   // 앞 단계 상품 칩이 없으면 여기서도 되살린다
+            int fixed = repairLessonChips();
+            if (fixed) {
+                char b2[64];
+                std::snprintf(b2, sizeof(b2), "없어진 부품 %d개를 되살렸다", fixed);
+                say(b2);
+            }
+        }
         dropHandles(); tool = 0;
         undoStack.clear(); redoStack.clear();
         prev = takeSnap();
@@ -6157,6 +6251,20 @@ int main(int argc, char** argv) {
                                     doEditChip(cid);
                                     handled = true;
                                 } else if (cid >= 0 && toolDelBtn(row).has(mx, my)) {
+                                    // 학습에서 상품으로 받은 칩은 못 지운다 — 뒷 단계가 막힌다
+                                    bool prize = false;
+                                    if (screen == SC_LEARN)
+                                        for (int k = 0; k < LESSON_N && k < lessonDone; ++k)
+                                            if (LESSONS[k].bank && LESSONS[k].name
+                                                && chips[cid].name == LESSONS[k].name) prize = true;
+                                    if (prize) {
+                                        std::snprintf(toast, sizeof(toast),
+                                                      "'%s' 는 단계에서 받은 부품이라 못 지움",
+                                                      chips[cid].name.c_str());
+                                        toastLeft = 200;
+                                        handled = true;
+                                        continue;
+                                    }
                                     int uses = chipUses(cid);
                                     if (uses > 0) {
                                         std::snprintf(toast, sizeof(toast),
