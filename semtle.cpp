@@ -843,19 +843,18 @@ static uint32_t nextCp(const char*& s) {
     while (extra-- && (*s & 0xC0) == 0x80) cp = (cp << 6) | (*s++ & 0x3F);
     return cp;
 }
-// px 는 1배 기준 크기다. 실제로 그릴 때 화면 배율만큼 늘린다.
-static int textWidth(int px, const char* s) {
+// 아래 두 개는 진짜 픽셀 크기를 받는다 (배율을 이미 먹인 값).
+// 조작키 창처럼 창 크기에 맞춰 스스로 줄어야 하는 것만 이걸 쓴다.
+static int textWidthPx(int px, const char* s) {
     if (!fontOK) return 0;
-    px = S(px);
     float scale = stbtt_ScaleForPixelHeight(&font, (float)px);
     int w = 0;
     while (*s) { int adv, lsb; stbtt_GetCodepointHMetrics(&font, (int)nextCp(s), &adv, &lsb);
                  w += (int)(adv * scale + 0.5f); }
     return w;
 }
-static void drawText(SDL_Renderer* ren, int x, int y, int px, uint32_t col, const char* s) {
+static void drawTextPx(SDL_Renderer* ren, int x, int y, int px, uint32_t col, const char* s) {
     if (!fontOK) return;
-    px = S(px);
     float scale = stbtt_ScaleForPixelHeight(&font, (float)px);
     int asc, desc, gap; stbtt_GetFontVMetrics(&font, &asc, &desc, &gap);
     int baseline = y + (int)(asc * scale + 0.5f);
@@ -868,6 +867,11 @@ static void drawText(SDL_Renderer* ren, int x, int y, int px, uint32_t col, cons
         }
         x += g->adv;
     }
+}
+// px 는 1배 기준 크기다. 실제로 그릴 때 화면 배율만큼 늘린다.
+static int  textWidth(int px, const char* s) { return textWidthPx(S(px), s); }
+static void drawText(SDL_Renderer* ren, int x, int y, int px, uint32_t col, const char* s) {
+    drawTextPx(ren, x, y, S(px), col, s);
 }
 static void drawTextC(SDL_Renderer* ren, int cx, int y, int px, uint32_t col, const char* s) {
     drawText(ren, cx - textWidth(px, s) / 2, y, px, col, s);
@@ -2226,6 +2230,153 @@ static void drawConfirm(SDL_Renderer* ren, int hover) {
     fillRect(ren, n, hover == 1 ? 0x2C4A6A : 0x263140);
     frameRect(ren, n, hover == 1 ? 0x5A86BA : 0x3A4A5E);
     drawTextC(ren, n.x + n.w/2, n.y + (n.h - S(16))/2, 16, 0xC8DCF4, "계속하기  (Esc)");
+}
+
+// ─────────────────────────────────────────────────────────────
+// 조작키 창 (?)
+//
+// 키가 서른 개가 넘어서 README 를 안 보면 알 수가 없었다. 판 위에 띄운다.
+// 줄을 두 칸으로 나누고, 창이 작으면 글자를 줄여 맞춘다.
+// ─────────────────────────────────────────────────────────────
+
+static bool keysOn = false;
+
+struct KeyRow { const char* k; const char* what; };   // k 가 비면 묶음 제목
+
+static const KeyRow KEYS_L[] = {
+    { "", "놓기와 잇기" },
+    { "1 ~ 9",        "부품 고르기" },
+    { "`",            "손 도구 (고르기·끌기)" },
+    { "클릭",         "고른 부품을 빈 곳에 놓기" },
+    { "끌기",         "부품 옮기기" },
+    { "포트 끌기",    "선 잇기 (출력 → 입력)" },
+    { "우클릭",       "선 끊기 · 빈 곳에선 손 도구" },
+    { "/",            "부품 찾기" },
+
+    { "", "고르기" },
+    { "빈 판 끌기",   "여럿 고르기" },
+    { "Shift+클릭",   "하나씩 더하고 빼기" },
+    { "Ctrl+C · V",   "담기 · 커서 자리에 꺼내기" },
+    { "Ctrl+D",       "그 자리 옆에 하나 더" },
+    { "Del",          "고른 것 지우기" },
+
+    { "", "바꾸기" },
+    { "R",            "돌리기 (Shift 는 반대)" },
+    { "W",            "선 폭 (Shift 는 줄이기)" },
+    { "E",            "화면 줄 수 (Shift 는 줄이기)" },
+    { "Q",            "묶음·풀음 접고 펴기" },
+    { "F2",           "핀 이름 고치기" },
+    { "G",            "고른 것을 칩으로 묶기" },
+    { "칩 더블클릭",  "칩 속 고치기 (Esc 로 나옴)" },
+    { ", · .",        "클럭 빠르기" },
+};
+
+static const KeyRow KEYS_R[] = {
+    { "", "보기" },
+    { "휠",           "화면 옮기기 (Shift 는 가로)" },
+    { "Ctrl+휠",      "확대·축소" },
+    { "- · =",        "확대·축소" },
+    { "F",            "다 보이게 맞추기" },
+    { "0",            "100% 로" },
+    { "가운데 끌기",  "화면 옮기기" },
+    { "Tab",          "좌우 판 숨기기" },
+    { "[ · ]",        "글자 크기" },
+
+    { "", "학습" },
+    { "Enter",        "채점하기" },
+    { "H",            "힌트 펴고 접기" },
+    { "머리말 누르기","단계 목록으로" },
+
+    { "", "그 밖" },
+    { "Ctrl+Z",       "되돌리기" },
+    { "Ctrl+Shift+Z", "다시 하기 (Ctrl+Y 도)" },
+    { "Ctrl+S · O",   "내보내기 · 가져오기" },
+    { "P",            "멈추기" },
+    { "?",            "이 창" },
+    { "Esc",          "물러나기 · 첫 화면" },
+};
+static const int KEYS_LN = (int)(sizeof(KEYS_L) / sizeof(KEYS_L[0]));
+static const int KEYS_RN = (int)(sizeof(KEYS_R) / sizeof(KEYS_R[0]));
+
+// 이 창만 진짜 픽셀로 잰다. 글자 배율 2.2 에 창이 작으면 스물두 줄이 어떻게 해도
+// 안 들어가서, 배율을 따르되 안 맞으면 스스로 줄어들게 했다. 11픽셀보다는 안 작아진다.
+static const int KEYS_MIN_PX = 11;
+
+static int keysRowH(int fp)  { return fp + 7; }
+static int keysHeadH(int fp) { return fp + 14; }
+static int keysPad(int fp)   { return fp + 10; }
+
+// 한 칸의 너비 — 제일 긴 키와 제일 긴 설명을 재서 잡는다
+static int keysKeyW(const KeyRow* R, int n, int fp) {
+    int kw = 0;
+    for (int i = 0; i < n; ++i) if (*R[i].k) kw = std::max(kw, textWidthPx(fp, R[i].k));
+    return kw;
+}
+static int keysColW(const KeyRow* R, int n, int fp) {
+    int ww = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!*R[i].k) ww = std::max(ww, textWidthPx(fp + 1, R[i].what));
+        else          ww = std::max(ww, textWidthPx(fp, R[i].what));
+    }
+    return keysKeyW(R, n, fp) + fp + ww;
+}
+static int keysColH(const KeyRow* R, int n, int fp) {
+    int h = 0;
+    for (int i = 0; i < n; ++i) h += *R[i].k ? keysRowH(fp) : keysHeadH(fp);
+    return h;
+}
+
+static Rect keysBoxAt(int fp) {
+    int pad = keysPad(fp), gap = fp * 3;
+    int w = pad + keysColW(KEYS_L, KEYS_LN, fp) + gap + keysColW(KEYS_R, KEYS_RN, fp) + pad;
+    int h = fp * 4 + pad                                     // 제목 줄
+          + std::max(keysColH(KEYS_L, KEYS_LN, fp), keysColH(KEYS_R, KEYS_RN, fp))
+          + pad;
+    return { WIN_W/2 - w/2, WIN_H/2 - h/2, w, h };
+}
+// 배율을 따르되 창에 안 들어가면 줄인다
+static int keysFs() {
+    int top = std::max(KEYS_MIN_PX, S(14));
+    for (int fp = top; fp > KEYS_MIN_PX; --fp) {
+        Rect b = keysBoxAt(fp);
+        if (b.w <= WIN_W - S(12) && b.h <= WIN_H - S(12)) return fp;
+    }
+    return KEYS_MIN_PX;
+}
+static Rect keysBox() { return keysBoxAt(keysFs()); }
+
+static void drawKeysCol(SDL_Renderer* ren, const KeyRow* R, int n, int x, int y, int fp) {
+    int kw = keysKeyW(R, n, fp);
+    for (int i = 0; i < n; ++i) {
+        if (!*R[i].k) {                     // 묶음 제목
+            y += fp / 2;
+            drawTextPx(ren, x, y, fp + 1, 0x8FB4D8, R[i].what);
+            y += keysHeadH(fp) - fp / 2;
+            continue;
+        }
+        drawTextPx(ren, x, y, fp, 0xE8ECF4, R[i].k);
+        drawTextPx(ren, x + kw + fp, y, fp, 0x9AA0AE, R[i].what);
+        y += keysRowH(fp);
+    }
+}
+
+static void drawKeys(SDL_Renderer* ren) {
+    fillRect(ren, { 0, 0, WIN_W, WIN_H }, 0x000000, 170);
+    int fp = keysFs(), pad = keysPad(fp);
+    Rect b = keysBox();
+    fillRect(ren, b, 0x1B1F29);
+    frameRect(ren, b, 0x4A5468);
+
+    drawTextPx(ren, b.x + pad, b.y + pad, fp + 6, 0xE8ECF4, "조작키");
+    const char* shut = "아무 키나 눌러 닫기";
+    drawTextPx(ren, b.x + b.w - pad - textWidthPx(fp - 2, shut), b.y + pad + fp/2,
+               fp - 2, 0x6E7484, shut);
+    setCol(ren, 0x2E3440);
+    SDL_RenderDrawLine(ren, b.x + pad, b.y + pad + fp*2, b.x + b.w - pad, b.y + pad + fp*2);
+
+    int y0 = b.y + pad + fp * 4 - fp / 2;
+    drawKeysCol(ren, KEYS_L, KEYS_LN, b.x + pad, y0, fp);
+    drawKeysCol(ren, KEYS_R, KEYS_RN, b.x + pad + keysColW(KEYS_L, KEYS_LN, fp) + fp*3, y0, fp);
 }
 
 // 힌트는 설명판 안이 아니라 판 위에 띄운다.
@@ -5124,8 +5275,8 @@ static int runTests() {
             "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)",
             "Shift+클릭=하나씩 · R=돌리기 · Q=접기 · F2=핀 이름 · Ctrl+C/V · G=묶기",
             "핀 하나만 골라야 이름을 고친다", "핀을 고르거나 핀 위에서 F2",
-            "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기",
-            "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기",
+            "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · ?=조작키",
+            "끌어서 고르기(Shift 로 더하기) · Del=지우기 · ?=조작키",
             "넣음 · ", "뺌 · ", "개 고름",
             "복사할 걸 먼저 골라", "복사해 둔 게 없음", "복제할 걸 먼저 골라",
             "지울 걸 먼저 골라",
@@ -5140,6 +5291,9 @@ static int runTests() {
         for (auto* t : USED) all.push_back(t);
         for (int i = 0; i < TYPE_N; ++i) all.push_back(TYPES[i].name);
         for (int i = 0; i < PART_N; ++i) { all.push_back(PARTS[i].name); all.push_back(PARTS[i].what); }
+        for (int i = 0; i < KEYS_LN; ++i) { all.push_back(KEYS_L[i].k); all.push_back(KEYS_L[i].what); }
+        for (int i = 0; i < KEYS_RN; ++i) { all.push_back(KEYS_R[i].k); all.push_back(KEYS_R[i].what); }
+        all.push_back("조작키"); all.push_back("아무 키나 눌러 닫기");
         for (int i = 0; i < LESSON_N; ++i) {
             all.push_back(LESSONS[i].title);
             all.push_back(LESSONS[i].text);
@@ -5718,6 +5872,38 @@ static int runTests() {
         check("단계 목록의 누른 자리가 맞는다", ok, buf);
     }
 
+    // 64. 조작키 창이 어느 창 크기에서나 다 들어간다
+    {
+        int ow = WIN_W, oh = WIN_H; float os = uiScale;
+        bool ok = true; char why[200] = "";
+        int small = 99;
+        const int SZ[3][2] = { { WIN_W_MIN, WIN_H_MIN }, { 1400, 880 }, { 1920, 1200 } };
+        for (float sc : { 0.8f, 1.0f, 1.6f, 2.2f }) {
+            uiScale = sc; applyUiScale();
+            for (auto& z : SZ) {
+                WIN_W = z[0]; WIN_H = z[1];
+                int fs = keysFs();
+                Rect b2 = keysBox();
+                small = std::min(small, fs);
+                if (b2.x < 0 || b2.y < 0 || b2.x + b2.w > WIN_W || b2.y + b2.h > WIN_H) {
+                    ok = false;
+                    std::snprintf(why, sizeof(why), "배율 %.1f %dx%d 에서 창 밖 (%dx%d 짜리)",
+                                  sc, z[0], z[1], b2.w, b2.h);
+                }
+                // 두 칸이 서로 겹치면 글이 뭉갠다
+                int lw = keysColW(KEYS_L, KEYS_LN, fs), rw = keysColW(KEYS_R, KEYS_RN, fs);
+                if (ok && keysPad(fs) * 2 + lw + fs * 3 + rw > b2.w) {
+                    ok = false;
+                    std::snprintf(why, sizeof(why), "배율 %.1f %dx%d 에서 두 칸이 겹친다", sc, z[0], z[1]);
+                }
+            }
+        }
+        uiScale = os; applyUiScale(); WIN_W = ow; WIN_H = oh;
+        if (ok) std::snprintf(buf, sizeof(buf), "배율 넷 × 크기 셋 다 들어감 (제일 작은 글자 %d)", small);
+        else    std::snprintf(buf, sizeof(buf), "%s", why);
+        check("조작키 창이 창 안에 들어온다", ok, buf);
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -6235,10 +6421,11 @@ int main(int argc, char** argv) {
             } else {
                 static const char* NAMES[] = {
                     "셈틀-첫화면.ppm", "셈틀-단계목록.ppm", "셈틀-학습.ppm",
-                    "셈틀-샌드박스.ppm", "셈틀-부품.ppm", "셈틀-고치기.ppm"
+                    "셈틀-샌드박스.ppm", "셈틀-부품.ppm", "셈틀-고치기.ppm",
+                    "셈틀-조작키.ppm"
                 };
                 if (shotAt > 0) writePPM(ren, NAMES[shotAt - 1]);
-                if (shotAt >= 6) { running = false; }
+                if (shotAt >= 7) { running = false; }
                 else {
                     // 다음 장면 차리기
                     editStack.clear(); dropHandles(); hintOn = false; uiOn = true;
@@ -6303,13 +6490,18 @@ int main(int argc, char** argv) {
                         }
                         addWire(world, ck, 0, ram, 3);
                         fitView();
-                    } else {                                 // 6) 칩 고치는 중
+                    } else if (shotAt == 5) {                // 6) 칩 고치는 중
                         screen = SC_SANDBOX;
                         if (!loadState()) { world = SubSim{}; seedDemo(); }
                         int target = -1;
                         for (int i = 0; i < (int)chips.size(); ++i)
                             if (chips[i].alive) { target = i; break; }
                         if (target >= 0) { beginEdit(target); fitView(); }
+                    } else {                                 // 7) 조작키 창
+                        editStack.clear();
+                        screen = SC_SANDBOX;
+                        if (!loadState()) { world = SubSim{}; seedDemo(); }
+                        fitView(); keysOn = true;
                     }
                     shotWait = 90;                           // 값이 자리잡을 시간
                 }
@@ -6853,6 +7045,8 @@ int main(int argc, char** argv) {
             if (smokeLeft == 10) doGrade();                      // 못 푼 채로 채점
             if (smokeLeft == 6)  { lessonDone = LESSON_N; lessonAt = LESSON_N - 1;
                                    setupLesson(lessonAt); hintOn = true; }   // 마지막 단계 + 힌트
+            if (smokeLeft == 8)  keysOn = true;                  // 조작키 창
+            if (smokeLeft == 7)  keysOn = false;
             if (smokeLeft == 4)  uiOn = false;                   // 학습 모드에서 판 숨기기
             if (smokeLeft == 2)  { uiOn = true; }
             if (--smokeLeft <= 0) running = false;
@@ -6972,8 +7166,8 @@ int main(int argc, char** argv) {
                    : (tool != 0
                       ? "빈 곳=놓기 · 부품 잡고 끌면 옮기기 · 우클릭=손 도구 (선 위면 끊기)"
                       : (screen == SC_LEARN
-                         ? "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · 선은 우클릭으로 끊기"
-                         : "끌어서 고르기(Shift 로 더하기) · Del=지우기 · 선은 우클릭으로 끊기")));
+                         ? "Enter=채점 · 끌어서 고르기(Shift 로 더하기) · ?=조작키"
+                         : "끌어서 고르기(Shift 로 더하기) · Del=지우기 · ?=조작키")));
             drawText(ren, right - textWidth(11, hint), top + S(20), 11, 0x60646E, hint);
         }
 
@@ -7017,6 +7211,7 @@ int main(int argc, char** argv) {
         }
 
         if (screen == SC_LEARN && hintOn) drawHint(ren);
+        if (keysOn) drawKeys(ren);
 
         if (confirming) {
             int hv = -1;
