@@ -1989,17 +1989,19 @@ struct LesFit { int ts, tl, rh, hs, need, room; };
 static LesFit lessonFit(const Lesson& L, int winH) {
     int lines = 1;
     for (const char* c = L.text; *c; ++c) if (*c == '\n') ++lines;
-    int rows = 1 << L.nIn;
+    int rows = (L.script && L.nStep > 0) ? L.nStep : (1 << L.nIn);
     bool hasAllow = (L.allow && *L.allow);
 
     // ts·hs 는 1배 기준 글자 크기, tl·rh 는 화면에서의 줄 높이다.
+    // 대본 단계는 진리표보다 칸이 많다. 표 줄을 좀 더 좁게 잡는다.
+    bool tight = (L.script && L.nStep > 6);
     LesFit f{ 15, 0, 0, 15, 0, (winH - S(178)) - S(16) };
     for (;;) {
         f.tl = S(f.ts + 6);
-        f.rh = S(f.ts + 5);
+        f.rh = S(f.ts + (tight ? 1 : 5));
         f.need = S(34) + lines * f.tl + S(12) + (S(f.hs) + S(8)) + (f.rh + S(3)) + rows * f.rh
                + (hasAllow ? S(40) : 0);
-        if (f.need <= f.room || f.ts <= 10) break;
+        if (f.need <= f.room || f.ts <= 9) break;
         --f.ts; if (f.hs > 11) --f.hs;
     }
     return f;
@@ -2037,7 +2039,9 @@ static void drawLessonPanel(SDL_Renderer* ren, const char* msg, bool msgOK, int 
     }
 
     y += S(12);
-    drawText(ren, p.x + S(16), y, hs, 0xC8CEDC, "이렇게 돌아야 한다"); y += S(hs) + S(8);
+    drawText(ren, p.x + S(16), y, hs, 0xC8CEDC,
+             (L.script && L.nStep > 0) ? "차례대로 이렇게" : "이렇게 돌아야 한다");
+    y += S(hs) + S(8);
 
     // 진리표
     int nCol = L.nIn + L.nOut;
@@ -2053,13 +2057,22 @@ static void drawLessonPanel(SDL_Renderer* ren, const char* msg, bool msgOK, int 
     SDL_RenderDrawLine(ren, x0 + L.nIn*colW - S(2), y - rh - S(6),
                             x0 + L.nIn*colW - S(2), y + rows*rh);
 
+    bool useScript = (L.script && L.nStep > 0);
     for (int t2 = 0; t2 < rows; ++t2) {
+        char b[8];
         for (int i = 0; i < L.nIn; ++i) {
-            char b[2] = { (char)('0' + ((t2 >> i) & 1)), 0 };
+            if (useScript) std::snprintf(b, sizeof(b), "%d",
+                              (int)maskTo(L.script[t2].in[i], lesInW(L, i)));
+            else           std::snprintf(b, sizeof(b), "%d", (t2 >> i) & 1);
             drawTextC(ren, x0 + colW/2 + i*colW, y, ts, 0x8A90A0, b);
         }
         for (int i = 0; i < L.nOut; ++i) {
-            char b[2] = { (char)('0' + L.want[t2][i]), 0 };
+            if (useScript) {
+                if (L.script[t2].check & (1u << i))
+                    std::snprintf(b, sizeof(b), "%d",
+                                  (int)maskTo(L.script[t2].want[i], lesOutW(L, i)));
+                else std::snprintf(b, sizeof(b), "·");       // 이 칸은 안 본다
+            } else std::snprintf(b, sizeof(b), "%d", L.want[t2][i]);
             drawTextC(ren, x0 + colW/2 + (L.nIn + i)*colW, y, ts, 0xE8ECF4, b);
         }
         y += rh;
@@ -2994,6 +3007,330 @@ static int lessonByTitle(const char* t) {
     return -1;
 }
 
+// 각 단계의 정답 회로를 판에 짓는다.
+// 검사(29번)와 정답 그림 뽑기가 같은 코드를 쓴다 — 따로 두면 어느 한쪽이 낡는다.
+// setupLesson(at) 을 먼저 부르고, 앞 단계 칩들이 chips 에 있어야 한다.
+static bool buildSolution(int at, char* err, size_t errN) {
+    const Lesson& L = LESSONS[at];
+    auto chipNamed = [&](const char* n) {
+        for (int i = 0; i < (int)chips.size(); ++i)
+            if (chips[i].alive && chips[i].name == n) return i;
+        return -1;
+    };
+    bool broke = false;
+    char detail[200] = "";
+            int A  = findPin(PIN_IN, L.inName[0]);
+            int B  = L.nIn > 1 ? findPin(PIN_IN, L.inName[1]) : -1;
+            int C  = L.nIn > 2 ? findPin(PIN_IN, L.inName[2]) : -1;
+            int O0 = findPin(PIN_OUT, L.outName[0]);
+            int O1 = L.nOut > 1 ? findPin(PIN_OUT, L.outName[1]) : -1;
+            int O2 = L.nOut > 2 ? findPin(PIN_OUT, L.outName[2]) : -1;
+
+            // 붙박이 게이트 하나로 끝나는 단계는 표를 보고 알아서 고른다
+            auto plain = [&](int type) {
+                int g = addComp(world, type, 300, 170);
+                addWire(world, A, 0, g, 0);
+                if (B >= 0) addWire(world, B, 0, g, 1);
+                addWire(world, g, 0, O0, 0);
+            };
+            // 셋을 둘씩 두 번에 나눠 본다
+            auto three = [&](int type) {
+                int g1 = addComp(world, type, 270, 150), g2 = addComp(world, type, 400, 220);
+                addWire(world, A, 0, g1, 0); addWire(world, B, 0, g1, 1);
+                addWire(world, g1, 0, g2, 0); addWire(world, C, 0, g2, 1);
+                addWire(world, g2, 0, O0, 0);
+            };
+
+            std::string t = L.title;
+            if      (t.find("이어 보기") != std::string::npos) addWire(world, A, 0, O0, 0);
+            else if (t.find("하나가 둘") != std::string::npos) {
+                addWire(world, A, 0, O0, 0); addWire(world, A, 0, O1, 0);
+            }
+            else if (t.find("AND — 둘 다") != std::string::npos) plain(T_AND);
+            else if (t.find("OR — 하나만")  != std::string::npos) plain(T_OR);
+            else if (t.find("NOT — 뒤집기") != std::string::npos) plain(T_NOT);
+            else if (t.find("XOR — 다를")   != std::string::npos) plain(T_XOR);
+            else if (t.find("NAND — AND")   != std::string::npos) plain(T_NAND);
+            else if (t.find("NOR — OR")     != std::string::npos) plain(T_NOR);
+            else if (t.find("셋 다 켜졌")   != std::string::npos) three(T_AND);
+            else if (t.find("셋 중 하나라도") != std::string::npos) three(T_OR);
+            else if (t.find("다수결") != std::string::npos) {
+                // (A와B) 또는 (B와C) 또는 (A와C)
+                int ab = addComp(world, T_AND, 250, 110), bc = addComp(world, T_AND, 250, 230);
+                int ac = addComp(world, T_AND, 250, 350);
+                int o1 = addComp(world, T_OR, 390, 170), o2 = addComp(world, T_OR, 500, 260);
+                addWire(world, A, 0, ab, 0); addWire(world, B, 0, ab, 1);
+                addWire(world, B, 0, bc, 0); addWire(world, C, 0, bc, 1);
+                addWire(world, A, 0, ac, 0); addWire(world, C, 0, ac, 1);
+                addWire(world, ab, 0, o1, 0); addWire(world, bc, 0, o1, 1);
+                addWire(world, o1, 0, o2, 0); addWire(world, ac, 0, o2, 1);
+                addWire(world, o2, 0, O0, 0);
+            }
+            else if (t.find("NAND 로 NOT") != std::string::npos) {   // NAND(A, A)
+                int g = addComp(world, T_NAND, 300, 170);
+                addWire(world, A, 0, g, 0); addWire(world, A, 0, g, 1);
+                addWire(world, g, 0, O0, 0);
+            }
+            else if (t.find("NAND 로 AND") != std::string::npos) {   // NOT(NAND(A,B))
+                int ni = chipNamed("NOT짜기");
+                if (ni < 0) { std::snprintf(detail, sizeof(detail), "%d단계: NOT짜기 칩이 없다", at+1); broke = true; }
+                int g = addComp(world, T_NAND, 250, 180), n = addChip(world, ni, 380, 180);
+                addWire(world, A, 0, g, 0); addWire(world, B, 0, g, 1);
+                addWire(world, g, 0, n, 0); addWire(world, n, 0, O0, 0);
+            }
+            else if (t.find("NAND 로 OR") != std::string::npos) {    // NAND(NOT A, NOT B)
+                int ni = chipNamed("NOT짜기");
+                if (ni < 0) { std::snprintf(detail, sizeof(detail), "%d단계: NOT짜기 칩이 없다", at+1); broke = true; }
+                int na = addChip(world, ni, 230, 110), nb = addChip(world, ni, 230, 250);
+                int g  = addComp(world, T_NAND, 380, 180);
+                addWire(world, A, 0, na, 0); addWire(world, B, 0, nb, 0);
+                addWire(world, na, 0, g, 0); addWire(world, nb, 0, g, 1);
+                addWire(world, g, 0, O0, 0);
+            }
+            else if (t.find("NAND 로 XOR") != std::string::npos) {   // AND(OR(A,B), NAND(A,B))
+                int oi = chipNamed("OR짜기"), ai = chipNamed("AND짜기");
+                if (oi < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; }
+                int o = addChip(world, oi, 230, 100);
+                int g = addComp(world, T_NAND, 240, 260);
+                int a2 = addChip(world, ai, 390, 180);
+                addWire(world, A, 0, o, 0); addWire(world, B, 0, o, 1);
+                addWire(world, A, 0, g, 0); addWire(world, B, 0, g, 1);
+                addWire(world, o, 0, a2, 0); addWire(world, g, 0, a2, 1);
+                addWire(world, a2, 0, O0, 0);
+            }
+            else if (t.find("한 자리 덧셈") != std::string::npos) {  // XOR + AND
+                int x = addComp(world, T_XOR, 300, 130), n = addComp(world, T_AND, 300, 260);
+                addWire(world, A, 0, x, 0); addWire(world, B, 0, x, 1);
+                addWire(world, A, 0, n, 0); addWire(world, B, 0, n, 1);
+                addWire(world, x, 0, O0, 0); addWire(world, n, 0, O1, 0);
+            }
+            else if (t.find("기억하기") != std::string::npos) {       // SR 래치
+                // Q = NOR(리셋, Q아님),  Q아님 = NOR(셋, Q)
+                int n1 = addComp(world, T_NOR, 300, 120);            // Q 쪽
+                int n2 = addComp(world, T_NOR, 300, 300);            // Q아님 쪽
+                addWire(world, B, 0, n1, 0);                          // 리셋
+                addWire(world, n2, 0, n1, 1);
+                addWire(world, A, 0, n2, 0);                          // 셋
+                addWire(world, n1, 0, n2, 1);
+                addWire(world, n1, 0, O0, 0);
+            }
+            else if (t.find("잡아 두기") != std::string::npos) {       // D 래치
+                int li = chipNamed("SR래치");
+                if (li < 0) { std::snprintf(detail, sizeof(detail), "%d단계: SR래치 칩이 없다", at+1); broke = true; }
+                int nt2 = addComp(world, T_NOT, 240, 300);
+                int as  = addComp(world, T_AND, 360, 130);            // 셋  = 값 & 받아라
+                int ar  = addComp(world, T_AND, 360, 300);            // 리셋 = ~값 & 받아라
+                int lat = addChip(world, li, 500, 200);
+                addWire(world, A, 0, as, 0); addWire(world, B, 0, as, 1);
+                addWire(world, A, 0, nt2, 0);
+                addWire(world, nt2, 0, ar, 0); addWire(world, B, 0, ar, 1);
+                addWire(world, as, 0, lat, 0); addWire(world, ar, 0, lat, 1);
+                addWire(world, lat, 0, O0, 0);
+            }
+            else if (t.find("순간만 잡기") != std::string::npos) {     // 엣지 플립플롭
+                int di = chipNamed("D래치");
+                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: D래치 칩이 없다", at+1); broke = true; }
+                int nc = addComp(world, T_NOT, 240, 320);
+                int m  = addChip(world, di, 380, 140);      // 앞엣것 (클럭 꺼졌을 때 받음)
+                int sl = addChip(world, di, 560, 220);      // 뒤엣것 (켜졌을 때 받음)
+                addWire(world, B, 0, nc, 0);
+                addWire(world, A, 0, m, 0); addWire(world, nc, 0, m, 1);
+                addWire(world, m, 0, sl, 0); addWire(world, B, 0, sl, 1);
+                addWire(world, sl, 0, O0, 0);
+            }
+            else if (t.find("여덟 칸") != std::string::npos) {         // 8비트 레지스터
+                int di = chipNamed("플립플롭");
+                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 플립플롭 칩이 없다", at+1); broke = true; }
+                int sp = addComp(world, SPLIT, 220, 200);
+                int bu = addComp(world, BUNDLE, 700, 200);
+                addWire(world, A, 0, sp, 0);                          // 값(8비트)
+                for (int k = 0; k < 8; ++k) {
+                    int d = addChip(world, di, 420, 40 + k * 70);
+                    addWire(world, sp, k, d, 0);                      // 그 비트
+                    addWire(world, B, 0, d, 1);                       // 받아라 (여덟 군데로)
+                    addWire(world, d, 0, bu, k);
+                }
+                addWire(world, bu, 0, O0, 0);
+            }
+            else if (t.find("여덟 자리 덧셈") != std::string::npos) {  // 8비트 덧셈기
+                int fi = chipNamed("전가산기");
+                if (fi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 전가산기 칩이 없다", at+1); broke = true; }
+                int spA = addComp(world, SPLIT, 200, 120);
+                int spB = addComp(world, SPLIT, 200, 360);
+                int bu  = addComp(world, BUNDLE, 800, 200);
+                addWire(world, A, 0, spA, 0);
+                addWire(world, B, 0, spB, 0);
+                int carry = -1;                       // 앞자리에서 넘어온 올림
+                for (int k = 0; k < 8; ++k) {
+                    int fa = addChip(world, fi, 480, 20 + k * 90);
+                    addWire(world, spA, k, fa, 0);
+                    addWire(world, spB, k, fa, 1);
+                    if (carry >= 0) addWire(world, carry, 1, fa, 2);   // 앞의 올림 → 올림입력
+                    addWire(world, fa, 0, bu, k);                      // 합
+                    carry = fa;
+                }
+                addWire(world, bu, 0, O0, 0);
+                if (carry >= 0) addWire(world, carry, 1, O1, 0);       // 맨 위 올림 = 넘침
+            }
+            else if (t.find("23. 세기") != std::string::npos) {         // 세는 상자
+                int ri = chipNamed("레지스터"), ai = chipNamed("덧셈기8");
+                if (ri < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; }
+                int reg = addChip(world, ri, 620, 200);
+                int add = addChip(world, ai, 380, 320);
+                int one = addComp(world, BUNDLE, 200, 420);            // 1 을 만든다
+                int sw1 = addComp(world, SWITCH, 60, 420);
+                setSwitch(sw1, 1);
+                addWire(world, sw1, 0, one, 0);                        // 0번 자리만 켜면 1
+                // 되돌리기면 0 이 들어가게 — 여덟 비트를 각각 AND 로 막는다
+                int nr = addComp(world, T_NOT, 200, 560);
+                addWire(world, B, 0, nr, 0);                           // 되돌리기 아님
+                int spS = addComp(world, SPLIT, 500, 520);
+                int buG = addComp(world, BUNDLE, 700, 520);
+                addWire(world, add, 0, spS, 0);                        // 더한 값을 풀고
+                for (int k = 0; k < 8; ++k) {
+                    int g = addComp(world, T_AND, 600, 500 + k * 60);
+                    addWire(world, spS, k, g, 0);
+                    addWire(world, nr, 0, g, 1);                       // 되돌리기면 0
+                    addWire(world, g, 0, buG, k);
+                }
+                addWire(world, buG, 0, reg, 0);                        // 레지스터로
+                addWire(world, A, 0, reg, 1);                          // 클럭 = 받아라
+                addWire(world, reg, 0, add, 0);                        // 되먹임
+                addWire(world, one, 0, add, 1);
+                addWire(world, reg, 0, O0, 0);
+            }
+            else if (t.find("더하고 빼기") != std::string::npos) {     // 계산기
+                int ai = chipNamed("덧셈기8");
+                if (ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 덧셈기8 칩이 없다", at+1); broke = true; }
+                // B 를 빼기와 XOR 해서 뒤집고, A 쪽에 빼기(=1)를 더해 2의 보수를 맞춘다
+                int spB = addComp(world, SPLIT, 220, 300);
+                int buB = addComp(world, BUNDLE, 460, 300);
+                addWire(world, B, 0, spB, 0);
+                for (int k = 0; k < 8; ++k) {
+                    int x = addComp(world, T_XOR, 340, 220 + k * 60);
+                    addWire(world, spB, k, x, 0);
+                    addWire(world, C, 0, x, 1);            // 빼기
+                    addWire(world, x, 0, buB, k);
+                }
+                int buOne = addComp(world, BUNDLE, 300, 60);   // 빼기면 1
+                addWire(world, C, 0, buOne, 0);
+                int add1 = addChip(world, ai, 520, 60);        // A + (빼기?1:0)
+                addWire(world, A, 0, add1, 0);
+                addWire(world, buOne, 0, add1, 1);
+                int add2 = addChip(world, ai, 720, 200);       // 그 결과 + 뒤집은 B
+                addWire(world, add1, 0, add2, 0);
+                addWire(world, buB, 0, add2, 1);
+                addWire(world, add2, 0, O0, 0);
+            }
+            else if (t.find("명령 읽기") != std::string::npos) {       // 해독기
+                int sp = addComp(world, SPLIT, 240, 200);
+                world.comps[sp].aux = 2; resizePorts(world.comps[sp]);
+                addWire(world, A, 0, sp, 0);
+                int n0 = addComp(world, T_NOT, 380, 120);      // 아랫자리 아님
+                int n1 = addComp(world, T_NOT, 380, 300);      // 윗자리 아님
+                addWire(world, sp, 0, n0, 0);
+                addWire(world, sp, 1, n1, 0);
+                int g0 = addComp(world, T_AND, 540, 100);      // 멈춤
+                addWire(world, n0, 0, g0, 0); addWire(world, n1, 0, g0, 1);
+                int g1 = addComp(world, T_AND, 540, 220);      // 불러오기
+                addWire(world, sp, 0, g1, 0); addWire(world, n1, 0, g1, 1);
+                int g2 = addComp(world, T_AND, 540, 340);      // 더하기
+                addWire(world, n0, 0, g2, 0); addWire(world, sp, 1, g2, 1);
+                addWire(world, g0, 0, O0, 0);
+                addWire(world, g1, 0, O1, 0);
+                addWire(world, g2, 0, O2, 0);
+            }
+            else if (t.find("쌓아 두는 곳") != std::string::npos) {    // 누산기
+                int ri = chipNamed("레지스터"), ci = chipNamed("계산기");
+                if (ri < 0 || ci < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; }
+                int reg = addChip(world, ri, 760, 200);
+                int alu = addChip(world, ci, 560, 300);
+                int sp  = addComp(world, SPLIT, 220, 420);
+                int bu  = addComp(world, BUNDLE, 440, 420);
+                addWire(world, reg, 0, sp, 0);                 // 누산기값을 풀어서
+                for (int k = 0; k < 8; ++k) {
+                    int g = addComp(world, T_AND, 330, 380 + k * 55);
+                    addWire(world, sp, k, g, 0);
+                    addWire(world, C, 0, g, 1);                // 더할까
+                    addWire(world, g, 0, bu, k);
+                }
+                addWire(world, bu, 0, alu, 0);                 // 계산기 A
+                addWire(world, B, 0, alu, 1);                  // 계산기 B = 값
+                addWire(world, alu, 0, reg, 0);
+                addWire(world, A, 0, reg, 1);                  // 클럭
+                addWire(world, reg, 0, O0, 0);
+            }
+            else if (t.find("스스로 도는 것") != std::string::npos) {   // 컴퓨터
+                int ci = chipNamed("세는상자"), di = chipNamed("해독기"), ai = chipNamed("누산기");
+                if (ci < 0 || di < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; }
+                int pc  = addChip(world, ci, 180, 200);
+                int ram = addComp(world, RAM, 380, 200);
+                int sp  = addComp(world, SPLIT, 560, 200);     // 명령 바이트를 여덟 가닥으로
+                int dec = addChip(world, di, 760, 120);
+                int acc = addChip(world, ai, 900, 300);
+
+                addWire(world, A, 0, pc, 0);                   // 클럭
+                addWire(world, B, 0, pc, 1);                   // 되돌리기
+                addWire(world, pc, 0, ram, 0);                 // 세는 값 → 주소
+                addWire(world, ram, 0, sp, 0);                 // 명령 바이트
+
+                int opBu = addComp(world, BUNDLE, 660, 60);    // 윗 2비트 → 해독기
+                opBu = opBu;
+                world.comps[opBu].aux = 2; resizePorts(world.comps[opBu]);
+                addWire(world, sp, 6, opBu, 0);
+                addWire(world, sp, 7, opBu, 1);
+                addWire(world, opBu, 0, dec, 0);
+
+                int valBu = addComp(world, BUNDLE, 660, 420);  // 아랫 6비트 → 누산기 값
+                for (int k = 0; k < 6; ++k) addWire(world, sp, k, valBu, k);
+
+                // 넣기나 더하기일 때만 누산기가 받는다
+                int orLd = addComp(world, T_OR, 860, 180);
+                addWire(world, dec, 1, orLd, 0);               // 불러오기
+                addWire(world, dec, 2, orLd, 1);               // 더하기
+                // 클럭이 올라갈 때만 실제로 받게 클럭과 AND
+                int gate = addComp(world, T_AND, 880, 240);
+                addWire(world, orLd, 0, gate, 0);
+                addWire(world, A, 0, gate, 1);
+
+                addWire(world, gate, 0, acc, 0);               // 누산기 클럭
+                addWire(world, valBu, 0, acc, 1);              // 값
+                addWire(world, dec, 2, acc, 2);                // 더할까
+                addWire(world, acc, 0, O0, 0);
+            }
+            else if (t.find("눌러서 넣기") != std::string::npos) {     // 스위치묶음
+                int sb = addComp(world, SWBANK, 300, 150);
+                world.comps[sb].out.assign(1, 181);
+                addWire(world, sb, 0, O0, 0);
+            }
+            else if (t.find("화면에 찍기") != std::string::npos) {     // 화면
+                int sc2 = addComp(world, SCREEN, 400, 120);
+                world.comps[sc2].aux = 8 | (8 << SCR_ROWS_SHIFT);
+                resizePorts(world.comps[sc2]);
+                addWire(world, A, 0, sc2, 0);        // 윗줄 → 0번
+                addWire(world, B, 0, sc2, 3);        // 가운뎃줄 → 3번
+                addWire(world, A, 0, O0, 0);         // 확인
+            }
+            else if (t.find("램으로 그림") != std::string::npos) {     // 글자찍개
+                int ram = addComp(world, RAM, 400, 150);
+                addWire(world, A, 0, ram, 0);        // 줄번호 → 주소
+                addWire(world, ram, 0, O0, 0);       // 나온 값 → 그림
+            }
+            else {                                                   // 전가산기
+                int hi = chipNamed("반가산기");
+                if (hi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 반가산기 칩이 없다", at+1); broke = true; }
+                int h1 = addChip(world, hi, 230, 100), h2 = addChip(world, hi, 370, 190);
+                int orG = addComp(world, T_OR, 510, 300);
+                addWire(world, A, 0, h1, 0); addWire(world, B, 0, h1, 1);
+                addWire(world, h1, 0, h2, 0); addWire(world, C, 0, h2, 1);
+                addWire(world, h2, 0, O0, 0);
+                addWire(world, h1, 1, orG, 0); addWire(world, h2, 1, orG, 1);
+                addWire(world, orG, 0, O1, 0);
+            }
+    if (broke) { std::snprintf(err, errN, "%s", detail); return false; }
+    return true;
+}
+
 static int runTests() {
     char buf[256];
     // 검사가 진짜 저장 파일을 건드리면 안 된다. 따로 지정 안 했으면 임시 파일로.
@@ -3739,325 +4076,13 @@ static int runTests() {
         screen = SC_LEARN; chips.clear();
         char why[160] = ""; int cleared = 0; char detail[200] = "";
 
-        auto chipNamed = [&](const char* n) {
-            for (int i = 0; i < (int)chips.size(); ++i)
-                if (chips[i].alive && chips[i].name == n) return i;
-            return -1;
-        };
         bool broke = false;
 
         for (int at = 0; at < LESSON_N && !broke; ++at) {
             const Lesson& L = LESSONS[at];
             lessonAt = at;
             setupLesson(at);
-            int A  = findPin(PIN_IN, L.inName[0]);
-            int B  = L.nIn > 1 ? findPin(PIN_IN, L.inName[1]) : -1;
-            int C  = L.nIn > 2 ? findPin(PIN_IN, L.inName[2]) : -1;
-            int O0 = findPin(PIN_OUT, L.outName[0]);
-            int O1 = L.nOut > 1 ? findPin(PIN_OUT, L.outName[1]) : -1;
-            int O2 = L.nOut > 2 ? findPin(PIN_OUT, L.outName[2]) : -1;
-
-            // 붙박이 게이트 하나로 끝나는 단계는 표를 보고 알아서 고른다
-            auto plain = [&](int type) {
-                int g = addComp(world, type, 300, 170);
-                addWire(world, A, 0, g, 0);
-                if (B >= 0) addWire(world, B, 0, g, 1);
-                addWire(world, g, 0, O0, 0);
-            };
-            // 셋을 둘씩 두 번에 나눠 본다
-            auto three = [&](int type) {
-                int g1 = addComp(world, type, 270, 150), g2 = addComp(world, type, 400, 220);
-                addWire(world, A, 0, g1, 0); addWire(world, B, 0, g1, 1);
-                addWire(world, g1, 0, g2, 0); addWire(world, C, 0, g2, 1);
-                addWire(world, g2, 0, O0, 0);
-            };
-
-            std::string t = L.title;
-            if      (t.find("이어 보기") != std::string::npos) addWire(world, A, 0, O0, 0);
-            else if (t.find("하나가 둘") != std::string::npos) {
-                addWire(world, A, 0, O0, 0); addWire(world, A, 0, O1, 0);
-            }
-            else if (t.find("AND — 둘 다") != std::string::npos) plain(T_AND);
-            else if (t.find("OR — 하나만")  != std::string::npos) plain(T_OR);
-            else if (t.find("NOT — 뒤집기") != std::string::npos) plain(T_NOT);
-            else if (t.find("XOR — 다를")   != std::string::npos) plain(T_XOR);
-            else if (t.find("NAND — AND")   != std::string::npos) plain(T_NAND);
-            else if (t.find("NOR — OR")     != std::string::npos) plain(T_NOR);
-            else if (t.find("셋 다 켜졌")   != std::string::npos) three(T_AND);
-            else if (t.find("셋 중 하나라도") != std::string::npos) three(T_OR);
-            else if (t.find("다수결") != std::string::npos) {
-                // (A와B) 또는 (B와C) 또는 (A와C)
-                int ab = addComp(world, T_AND, 250, 110), bc = addComp(world, T_AND, 250, 230);
-                int ac = addComp(world, T_AND, 250, 350);
-                int o1 = addComp(world, T_OR, 390, 170), o2 = addComp(world, T_OR, 500, 260);
-                addWire(world, A, 0, ab, 0); addWire(world, B, 0, ab, 1);
-                addWire(world, B, 0, bc, 0); addWire(world, C, 0, bc, 1);
-                addWire(world, A, 0, ac, 0); addWire(world, C, 0, ac, 1);
-                addWire(world, ab, 0, o1, 0); addWire(world, bc, 0, o1, 1);
-                addWire(world, o1, 0, o2, 0); addWire(world, ac, 0, o2, 1);
-                addWire(world, o2, 0, O0, 0);
-            }
-            else if (t.find("NAND 로 NOT") != std::string::npos) {   // NAND(A, A)
-                int g = addComp(world, T_NAND, 300, 170);
-                addWire(world, A, 0, g, 0); addWire(world, A, 0, g, 1);
-                addWire(world, g, 0, O0, 0);
-            }
-            else if (t.find("NAND 로 AND") != std::string::npos) {   // NOT(NAND(A,B))
-                int ni = chipNamed("NOT짜기");
-                if (ni < 0) { std::snprintf(detail, sizeof(detail), "%d단계: NOT짜기 칩이 없다", at+1); broke = true; break; }
-                int g = addComp(world, T_NAND, 250, 180), n = addChip(world, ni, 380, 180);
-                addWire(world, A, 0, g, 0); addWire(world, B, 0, g, 1);
-                addWire(world, g, 0, n, 0); addWire(world, n, 0, O0, 0);
-            }
-            else if (t.find("NAND 로 OR") != std::string::npos) {    // NAND(NOT A, NOT B)
-                int ni = chipNamed("NOT짜기");
-                if (ni < 0) { std::snprintf(detail, sizeof(detail), "%d단계: NOT짜기 칩이 없다", at+1); broke = true; break; }
-                int na = addChip(world, ni, 230, 110), nb = addChip(world, ni, 230, 250);
-                int g  = addComp(world, T_NAND, 380, 180);
-                addWire(world, A, 0, na, 0); addWire(world, B, 0, nb, 0);
-                addWire(world, na, 0, g, 0); addWire(world, nb, 0, g, 1);
-                addWire(world, g, 0, O0, 0);
-            }
-            else if (t.find("NAND 로 XOR") != std::string::npos) {   // AND(OR(A,B), NAND(A,B))
-                int oi = chipNamed("OR짜기"), ai = chipNamed("AND짜기");
-                if (oi < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
-                int o = addChip(world, oi, 230, 100);
-                int g = addComp(world, T_NAND, 240, 260);
-                int a2 = addChip(world, ai, 390, 180);
-                addWire(world, A, 0, o, 0); addWire(world, B, 0, o, 1);
-                addWire(world, A, 0, g, 0); addWire(world, B, 0, g, 1);
-                addWire(world, o, 0, a2, 0); addWire(world, g, 0, a2, 1);
-                addWire(world, a2, 0, O0, 0);
-            }
-            else if (t.find("한 자리 덧셈") != std::string::npos) {  // XOR + AND
-                int x = addComp(world, T_XOR, 300, 130), n = addComp(world, T_AND, 300, 260);
-                addWire(world, A, 0, x, 0); addWire(world, B, 0, x, 1);
-                addWire(world, A, 0, n, 0); addWire(world, B, 0, n, 1);
-                addWire(world, x, 0, O0, 0); addWire(world, n, 0, O1, 0);
-            }
-            else if (t.find("기억하기") != std::string::npos) {       // SR 래치
-                // Q = NOR(리셋, Q아님),  Q아님 = NOR(셋, Q)
-                int n1 = addComp(world, T_NOR, 300, 120);            // Q 쪽
-                int n2 = addComp(world, T_NOR, 300, 300);            // Q아님 쪽
-                addWire(world, B, 0, n1, 0);                          // 리셋
-                addWire(world, n2, 0, n1, 1);
-                addWire(world, A, 0, n2, 0);                          // 셋
-                addWire(world, n1, 0, n2, 1);
-                addWire(world, n1, 0, O0, 0);
-            }
-            else if (t.find("잡아 두기") != std::string::npos) {       // D 래치
-                int li = chipNamed("SR래치");
-                if (li < 0) { std::snprintf(detail, sizeof(detail), "%d단계: SR래치 칩이 없다", at+1); broke = true; break; }
-                int nt2 = addComp(world, T_NOT, 240, 300);
-                int as  = addComp(world, T_AND, 360, 130);            // 셋  = 값 & 받아라
-                int ar  = addComp(world, T_AND, 360, 300);            // 리셋 = ~값 & 받아라
-                int lat = addChip(world, li, 500, 200);
-                addWire(world, A, 0, as, 0); addWire(world, B, 0, as, 1);
-                addWire(world, A, 0, nt2, 0);
-                addWire(world, nt2, 0, ar, 0); addWire(world, B, 0, ar, 1);
-                addWire(world, as, 0, lat, 0); addWire(world, ar, 0, lat, 1);
-                addWire(world, lat, 0, O0, 0);
-            }
-            else if (t.find("순간만 잡기") != std::string::npos) {     // 엣지 플립플롭
-                int di = chipNamed("D래치");
-                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: D래치 칩이 없다", at+1); broke = true; break; }
-                int nc = addComp(world, T_NOT, 240, 320);
-                int m  = addChip(world, di, 380, 140);      // 앞엣것 (클럭 꺼졌을 때 받음)
-                int sl = addChip(world, di, 560, 220);      // 뒤엣것 (켜졌을 때 받음)
-                addWire(world, B, 0, nc, 0);
-                addWire(world, A, 0, m, 0); addWire(world, nc, 0, m, 1);
-                addWire(world, m, 0, sl, 0); addWire(world, B, 0, sl, 1);
-                addWire(world, sl, 0, O0, 0);
-            }
-            else if (t.find("여덟 칸") != std::string::npos) {         // 8비트 레지스터
-                int di = chipNamed("플립플롭");
-                if (di < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 플립플롭 칩이 없다", at+1); broke = true; break; }
-                int sp = addComp(world, SPLIT, 220, 200);
-                int bu = addComp(world, BUNDLE, 700, 200);
-                addWire(world, A, 0, sp, 0);                          // 값(8비트)
-                for (int k = 0; k < 8; ++k) {
-                    int d = addChip(world, di, 420, 40 + k * 70);
-                    addWire(world, sp, k, d, 0);                      // 그 비트
-                    addWire(world, B, 0, d, 1);                       // 받아라 (여덟 군데로)
-                    addWire(world, d, 0, bu, k);
-                }
-                addWire(world, bu, 0, O0, 0);
-            }
-            else if (t.find("여덟 자리 덧셈") != std::string::npos) {  // 8비트 덧셈기
-                int fi = chipNamed("전가산기");
-                if (fi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 전가산기 칩이 없다", at+1); broke = true; break; }
-                int spA = addComp(world, SPLIT, 200, 120);
-                int spB = addComp(world, SPLIT, 200, 360);
-                int bu  = addComp(world, BUNDLE, 800, 200);
-                addWire(world, A, 0, spA, 0);
-                addWire(world, B, 0, spB, 0);
-                int carry = -1;                       // 앞자리에서 넘어온 올림
-                for (int k = 0; k < 8; ++k) {
-                    int fa = addChip(world, fi, 480, 20 + k * 90);
-                    addWire(world, spA, k, fa, 0);
-                    addWire(world, spB, k, fa, 1);
-                    if (carry >= 0) addWire(world, carry, 1, fa, 2);   // 앞의 올림 → 올림입력
-                    addWire(world, fa, 0, bu, k);                      // 합
-                    carry = fa;
-                }
-                addWire(world, bu, 0, O0, 0);
-                if (carry >= 0) addWire(world, carry, 1, O1, 0);       // 맨 위 올림 = 넘침
-            }
-            else if (t.find("23. 세기") != std::string::npos) {         // 세는 상자
-                int ri = chipNamed("레지스터"), ai = chipNamed("덧셈기8");
-                if (ri < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
-                int reg = addChip(world, ri, 620, 200);
-                int add = addChip(world, ai, 380, 320);
-                int one = addComp(world, BUNDLE, 200, 420);            // 1 을 만든다
-                int sw1 = addComp(world, SWITCH, 60, 420);
-                setSwitch(sw1, 1);
-                addWire(world, sw1, 0, one, 0);                        // 0번 자리만 켜면 1
-                // 되돌리기면 0 이 들어가게 — 여덟 비트를 각각 AND 로 막는다
-                int nr = addComp(world, T_NOT, 200, 560);
-                addWire(world, B, 0, nr, 0);                           // 되돌리기 아님
-                int spS = addComp(world, SPLIT, 500, 520);
-                int buG = addComp(world, BUNDLE, 700, 520);
-                addWire(world, add, 0, spS, 0);                        // 더한 값을 풀고
-                for (int k = 0; k < 8; ++k) {
-                    int g = addComp(world, T_AND, 600, 500 + k * 60);
-                    addWire(world, spS, k, g, 0);
-                    addWire(world, nr, 0, g, 1);                       // 되돌리기면 0
-                    addWire(world, g, 0, buG, k);
-                }
-                addWire(world, buG, 0, reg, 0);                        // 레지스터로
-                addWire(world, A, 0, reg, 1);                          // 클럭 = 받아라
-                addWire(world, reg, 0, add, 0);                        // 되먹임
-                addWire(world, one, 0, add, 1);
-                addWire(world, reg, 0, O0, 0);
-            }
-            else if (t.find("더하고 빼기") != std::string::npos) {     // 계산기
-                int ai = chipNamed("덧셈기8");
-                if (ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 덧셈기8 칩이 없다", at+1); broke = true; break; }
-                // B 를 빼기와 XOR 해서 뒤집고, A 쪽에 빼기(=1)를 더해 2의 보수를 맞춘다
-                int spB = addComp(world, SPLIT, 220, 300);
-                int buB = addComp(world, BUNDLE, 460, 300);
-                addWire(world, B, 0, spB, 0);
-                for (int k = 0; k < 8; ++k) {
-                    int x = addComp(world, T_XOR, 340, 220 + k * 60);
-                    addWire(world, spB, k, x, 0);
-                    addWire(world, C, 0, x, 1);            // 빼기
-                    addWire(world, x, 0, buB, k);
-                }
-                int buOne = addComp(world, BUNDLE, 300, 60);   // 빼기면 1
-                addWire(world, C, 0, buOne, 0);
-                int add1 = addChip(world, ai, 520, 60);        // A + (빼기?1:0)
-                addWire(world, A, 0, add1, 0);
-                addWire(world, buOne, 0, add1, 1);
-                int add2 = addChip(world, ai, 720, 200);       // 그 결과 + 뒤집은 B
-                addWire(world, add1, 0, add2, 0);
-                addWire(world, buB, 0, add2, 1);
-                addWire(world, add2, 0, O0, 0);
-            }
-            else if (t.find("명령 읽기") != std::string::npos) {       // 해독기
-                int sp = addComp(world, SPLIT, 240, 200);
-                world.comps[sp].aux = 2; resizePorts(world.comps[sp]);
-                addWire(world, A, 0, sp, 0);
-                int n0 = addComp(world, T_NOT, 380, 120);      // 아랫자리 아님
-                int n1 = addComp(world, T_NOT, 380, 300);      // 윗자리 아님
-                addWire(world, sp, 0, n0, 0);
-                addWire(world, sp, 1, n1, 0);
-                int g0 = addComp(world, T_AND, 540, 100);      // 멈춤
-                addWire(world, n0, 0, g0, 0); addWire(world, n1, 0, g0, 1);
-                int g1 = addComp(world, T_AND, 540, 220);      // 불러오기
-                addWire(world, sp, 0, g1, 0); addWire(world, n1, 0, g1, 1);
-                int g2 = addComp(world, T_AND, 540, 340);      // 더하기
-                addWire(world, n0, 0, g2, 0); addWire(world, sp, 1, g2, 1);
-                addWire(world, g0, 0, O0, 0);
-                addWire(world, g1, 0, O1, 0);
-                addWire(world, g2, 0, O2, 0);
-            }
-            else if (t.find("쌓아 두는 곳") != std::string::npos) {    // 누산기
-                int ri = chipNamed("레지스터"), ci = chipNamed("계산기");
-                if (ri < 0 || ci < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
-                int reg = addChip(world, ri, 760, 200);
-                int alu = addChip(world, ci, 560, 300);
-                int sp  = addComp(world, SPLIT, 220, 420);
-                int bu  = addComp(world, BUNDLE, 440, 420);
-                addWire(world, reg, 0, sp, 0);                 // 누산기값을 풀어서
-                for (int k = 0; k < 8; ++k) {
-                    int g = addComp(world, T_AND, 330, 380 + k * 55);
-                    addWire(world, sp, k, g, 0);
-                    addWire(world, C, 0, g, 1);                // 더할까
-                    addWire(world, g, 0, bu, k);
-                }
-                addWire(world, bu, 0, alu, 0);                 // 계산기 A
-                addWire(world, B, 0, alu, 1);                  // 계산기 B = 값
-                addWire(world, alu, 0, reg, 0);
-                addWire(world, A, 0, reg, 1);                  // 클럭
-                addWire(world, reg, 0, O0, 0);
-            }
-            else if (t.find("스스로 도는 것") != std::string::npos) {   // 컴퓨터
-                int ci = chipNamed("세는상자"), di = chipNamed("해독기"), ai = chipNamed("누산기");
-                if (ci < 0 || di < 0 || ai < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 앞 칩이 없다", at+1); broke = true; break; }
-                int pc  = addChip(world, ci, 180, 200);
-                int ram = addComp(world, RAM, 380, 200);
-                int sp  = addComp(world, SPLIT, 560, 200);     // 명령 바이트를 여덟 가닥으로
-                int dec = addChip(world, di, 760, 120);
-                int acc = addChip(world, ai, 900, 300);
-
-                addWire(world, A, 0, pc, 0);                   // 클럭
-                addWire(world, B, 0, pc, 1);                   // 되돌리기
-                addWire(world, pc, 0, ram, 0);                 // 세는 값 → 주소
-                addWire(world, ram, 0, sp, 0);                 // 명령 바이트
-
-                int opBu = addComp(world, BUNDLE, 660, 60);    // 윗 2비트 → 해독기
-                opBu = opBu;
-                world.comps[opBu].aux = 2; resizePorts(world.comps[opBu]);
-                addWire(world, sp, 6, opBu, 0);
-                addWire(world, sp, 7, opBu, 1);
-                addWire(world, opBu, 0, dec, 0);
-
-                int valBu = addComp(world, BUNDLE, 660, 420);  // 아랫 6비트 → 누산기 값
-                for (int k = 0; k < 6; ++k) addWire(world, sp, k, valBu, k);
-
-                // 넣기나 더하기일 때만 누산기가 받는다
-                int orLd = addComp(world, T_OR, 860, 180);
-                addWire(world, dec, 1, orLd, 0);               // 불러오기
-                addWire(world, dec, 2, orLd, 1);               // 더하기
-                // 클럭이 올라갈 때만 실제로 받게 클럭과 AND
-                int gate = addComp(world, T_AND, 880, 240);
-                addWire(world, orLd, 0, gate, 0);
-                addWire(world, A, 0, gate, 1);
-
-                addWire(world, gate, 0, acc, 0);               // 누산기 클럭
-                addWire(world, valBu, 0, acc, 1);              // 값
-                addWire(world, dec, 2, acc, 2);                // 더할까
-                addWire(world, acc, 0, O0, 0);
-            }
-            else if (t.find("눌러서 넣기") != std::string::npos) {     // 스위치묶음
-                int sb = addComp(world, SWBANK, 300, 150);
-                world.comps[sb].out.assign(1, 181);
-                addWire(world, sb, 0, O0, 0);
-            }
-            else if (t.find("화면에 찍기") != std::string::npos) {     // 화면
-                int sc2 = addComp(world, SCREEN, 400, 120);
-                world.comps[sc2].aux = 8 | (8 << SCR_ROWS_SHIFT);
-                resizePorts(world.comps[sc2]);
-                addWire(world, A, 0, sc2, 0);        // 윗줄 → 0번
-                addWire(world, B, 0, sc2, 3);        // 가운뎃줄 → 3번
-                addWire(world, A, 0, O0, 0);         // 확인
-            }
-            else if (t.find("램으로 그림") != std::string::npos) {     // 글자찍개
-                int ram = addComp(world, RAM, 400, 150);
-                addWire(world, A, 0, ram, 0);        // 줄번호 → 주소
-                addWire(world, ram, 0, O0, 0);       // 나온 값 → 그림
-            }
-            else {                                                   // 전가산기
-                int hi = chipNamed("반가산기");
-                if (hi < 0) { std::snprintf(detail, sizeof(detail), "%d단계: 반가산기 칩이 없다", at+1); broke = true; break; }
-                int h1 = addChip(world, hi, 230, 100), h2 = addChip(world, hi, 370, 190);
-                int orG = addComp(world, T_OR, 510, 300);
-                addWire(world, A, 0, h1, 0); addWire(world, B, 0, h1, 1);
-                addWire(world, h1, 0, h2, 0); addWire(world, C, 0, h2, 1);
-                addWire(world, h2, 0, O0, 0);
-                addWire(world, h1, 1, orG, 0); addWire(world, h2, 1, orG, 1);
-                addWire(world, orG, 0, O1, 0);
-            }
+            if (!buildSolution(at, detail, sizeof(detail))) { broke = true; break; }
 
             // 정답이 그 단계의 규칙을 지켰는지도 본다
             for (const auto& c : world.comps) {
@@ -4166,7 +4191,8 @@ static int runTests() {
             std::snprintf(buf, sizeof(buf), "배율 0.8~2.2 어디서나 다 들어감 (제일 작은 글자 %d)", smallest);
         else
             std::snprintf(buf, sizeof(buf), "배율 %.1f 의 %d단계가 %dpx 넘침", worstUs, worstAt + 1, worstOver);
-        check("설명판이 작은 창에서도 안 넘친다", worstAt < 0 && smallest >= 10, buf);
+        // 대본이 긴 단계는 9까지 줄어든다 (2.2배에서 실제 20px 라 읽을 만하다)
+        check("설명판이 작은 창에서도 안 넘친다", worstAt < 0 && smallest >= 9, buf);
     }
 
     // 32. 창 크기를 바꿔도 판 자리 계산이 안 어긋난다
@@ -4831,7 +4857,7 @@ static int runTests() {
             "◀ 앞", "뒤 ▶", "힌트 (H)", "힌트 닫기", "채점하기  (Enter)", "×", "고",
             "나가기  (Enter)", "계속하기  (Esc)", "첫 화면으로 나갈까?",
             "고치는 중:  ", "Esc : 나가서 반영", "H 로 닫기", "저장됨", "멈춤 (P)",
-            "이렇게 돌아야 한다", "쓸 수 있는 것:", "핀 이름:", "커스텀 게이트 이름:",
+            "이렇게 돌아야 한다", "차례대로 이렇게", "쓸 수 있는 것:", "핀 이름:", "커스텀 게이트 이름:",
             "Enter 로 만들기 · Esc 로 취소", "Enter 로 고치기 · Esc 로 취소",
             "고르면 바로 시작 · 안에서 Esc 로 여기 돌아옴 · [ ] 로 글자 크기",
             "배선과 게이트만으로 회로를 조합하는 판",
@@ -5312,6 +5338,7 @@ static void writePPM(SDL_Renderer* ren, const char* path) {
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--test") == 0) return runTests();
     const bool shotMode = (argc > 1 && std::strcmp(argv[1], "--shot") == 0);
+    const bool ansMode  = (argc > 1 && std::strcmp(argv[1], "--answers") == 0);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL 못 켬: %s\n", SDL_GetError());
@@ -5328,7 +5355,7 @@ int main(int argc, char** argv) {
         WIN_W0 = std::max(WIN_W0, WIN_W_MIN);
         WIN_H0 = std::max(WIN_H0, WIN_H_MIN);
     }
-    if (shotMode) { WIN_W0 = 1400; WIN_H0 = 880; }
+    if (shotMode || ansMode) { WIN_W0 = 1400; WIN_H0 = 880; }
     SDL_Window* win = SDL_CreateWindow("셈틀",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W0, WIN_H0,
         SDL_WINDOW_RESIZABLE);
@@ -5351,6 +5378,11 @@ int main(int argc, char** argv) {
     // 그림 뽑기: 장면을 하나씩 차리고 한 프레임 그린 뒤 파일로 저장한다.
     int shotAt = shotMode ? 0 : -1;
     int shotWait = 0;
+    // 정답 그림 뽑기: 단계마다 정답 회로를 짓고 한 장씩 찍는다
+    // 첫 화면 갈래가 continue 해 버리니 처음부터 학습 화면으로 둔다
+    int ansAt = ansMode ? 0 : -1;
+    int ansWait = 0;
+    if (ansMode) { screen = SC_LEARN; chips.clear(); world = SubSim{}; }
     bool smokeBad = false;      // 스모크가 잡아낸 잘못
 
     // 화면 없이 그리기 경로가 안 죽는지 보는 모드. 네 방향·여러 배율을 다 훑는다.
@@ -5471,7 +5503,7 @@ int main(int argc, char** argv) {
     };
     auto leaveToMenu = [&] {
         while (!editStack.empty()) endEdit();      // 고치던 칩은 마무리하고 나간다
-        if (screen != SC_MENU && shotAt < 0) saveState();   // 나가기 전에 확실히 써 둔다
+        if (screen != SC_MENU && shotAt < 0 && ansAt < 0) saveState();   // 나가기 전에 써 둔다
         screen = SC_MENU;
         confirming = false;
         dropHandles(); dirty = false;
@@ -6260,7 +6292,7 @@ int main(int argc, char** argv) {
 
         // 바뀐 뒤 잠깐 잠잠하면 저장한다. 끄는 손에도 안 놓치게 나갈 때 한 번 더.
         // 그림 뽑는 중에는 저장하지 않는다 — 진짜 저장본을 장면용 판으로 덮으면 안 된다
-        if (dirty && !smoke && shotAt < 0 && editStack.empty() && frame - dirtyAt > 45) {
+        if (dirty && !smoke && shotAt < 0 && ansAt < 0 && editStack.empty() && frame - dirtyAt > 45) {
             if (saveState()) { dirty = false; savedFlash = 90; }
             else             { dirty = false; say("저장 실패"); }
         }
@@ -6447,6 +6479,38 @@ int main(int argc, char** argv) {
                        renameComp >= 0 ? "Enter 로 고치기 · Esc 로 취소"
                                        : "Enter 로 만들기 · Esc 로 취소");
 
+        // 정답 그림 — 단계마다 정답을 짓고 값이 자리잡은 뒤 한 장
+        if (ansAt >= 0) {
+            if (ansWait > 0) {
+                --ansWait;
+            } else {
+                if (ansAt > 0) {                     // 앞 단계 그림을 저장하고 칩으로 담는다
+                    const Lesson& done = LESSONS[ansAt - 1];
+                    // 제목에서 앞의 "12. " 를 떼고 쓴다 (파일 이름에 번호가 두 번 들어가지 않게)
+                    const char* t2 = done.title;
+                    while (*t2 && (*t2 == ' ' || (*t2 >= '0' && *t2 <= '9') || *t2 == '.')) ++t2;
+                    char path[192];
+                    std::snprintf(path, sizeof(path), "정답/%02d-%s.ppm", ansAt, *t2 ? t2 : done.name);
+                    writePPM(ren, path);
+                    bankLesson(done);
+                }
+                if (ansAt >= LESSON_N) { running = false; }
+                else {
+                    screen = SC_LEARN; uiOn = true; hintOn = false;
+                    lessonAt = ansAt; lessonDone = ansAt;
+                    setupLesson(ansAt);
+                    char err[200] = "";
+                    if (!buildSolution(ansAt, err, sizeof(err)))
+                        std::fprintf(stderr, "%d단계 정답을 못 지음: %s\n", ansAt + 1, err);
+                    fitView();
+                    // 값이 자리잡을 때까지는 그리지 말고 시뮬만 돌린다 (그리면서 기다리면 아주 느리다)
+                    for (int k = 0; k < 200; ++k) tickSub(world);
+                    ansWait = 2;
+                }
+                ++ansAt;
+            }
+        }
+
         shotStep();
 
         // 판이 통째로 안 그려지는 일이 있었다(자르기를 안 풀어서). 스모크에서 잡는다.
@@ -6466,7 +6530,7 @@ int main(int argc, char** argv) {
         ++frame;
     }
 
-    if (shotAt >= 0) { editStack.clear(); dirty = false; }   // 그림 모드는 아무것도 안 쓴다
+    if (shotAt >= 0 || ansAt >= 0) { editStack.clear(); dirty = false; }   // 그림 모드는 안 쓴다
     while (!editStack.empty()) endEdit();       // 고치던 칩 마무리
     if (dirty && !smoke) saveState();          // 나가는 길에 못 쓴 것 마저
 
