@@ -4,6 +4,3 @@ semtle
 
 # 그림 뽑을 때 나오는 것
 *.ppm
-
-# 정답 그림 (./semtle --answers 로 다시 뽑을 수 있다)
-정답/
