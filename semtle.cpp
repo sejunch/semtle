@@ -786,6 +786,9 @@ static const char* FONT_PATHS[] = {
     "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/TTF/NanumGothic.ttf",
+    // 윈도우
+    "C:\\Windows\\Fonts\\malgun.ttf",
+    "C:\\Windows\\Fonts\\gulim.ttc",
 };
 static std::vector<unsigned char> fontData;
 static stbtt_fontinfo             font;
@@ -793,7 +796,7 @@ static bool                       fontOK = false;
 
 static bool loadFont() {
     const char* env = env2("SEMTLE_FONT", "LOGIC_FONT");
-    const char* tries[8]; int n = 0;
+    const char* tries[16]; int n = 0;        // 환경변수 하나 + FONT_PATHS
     if (env) tries[n++] = env;
     for (const char* p : FONT_PATHS) tries[n++] = p;
     for (int i = 0; i < n; ++i) {
