@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -2974,6 +2975,29 @@ static std::string savePath() {
 }
 
 // 만든 칩은 모드와 상관없이 한 곳에 둔다. 학습에서 딴 걸 샌드박스에서도 쓴다.
+// 저장 파일 다루기.
+//
+// 예전엔 폴더를 system("mkdir -p ...") 로 만들고 rename 으로 갈아치웠는데,
+// 윈도우에서는 둘 다 안 된다.
+//   · cmd 에는 mkdir -p 가 없고 작은따옴표도 안 먹는다
+//   · rename 은 대상 파일이 이미 있으면 실패한다 — POSIX 는 덮어쓴다.
+//     그래서 처음 저장은 되고 두 번째부터 조용히 실패했다.
+// <filesystem> 은 둘 다 알아서 해 준다 (윈도우에선 MoveFileEx 로 간다).
+static void 폴더만들기(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::path p(path);
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+}
+static bool 갈아치우기(const std::string& 임시, const std::string& 진짜) {
+    std::error_code ec;
+    std::filesystem::rename(임시, 진짜, ec);      // 있으면 덮어쓴다
+    if (!ec) return true;
+    std::filesystem::remove(진짜, ec);            // 그래도 안 되면 지우고 다시
+    ec.clear();
+    std::filesystem::rename(임시, 진짜, ec);
+    return !ec;
+}
+
 static std::string chipsPath() {
     const char* over = env2("SEMTLE_SAVE", "LOGIC_SAVE");
     if (over) return std::string(over) + ".chips";
@@ -3100,12 +3124,7 @@ static bool readSub(std::FILE* f, SubSim& s) {
 }
 
 static bool saveTo(const std::string& path, bool withChips) {
-    size_t slash = path.rfind('/');
-    if (slash != std::string::npos) {          // 폴더가 없으면 만든다
-        std::string dir = path.substr(0, slash);
-        std::string cmd = "mkdir -p '" + dir + "'";
-        if (std::system(cmd.c_str()) != 0) { /* 있으면 그만 */ }
-    }
+    폴더만들기(path);
     std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "w");
     if (!f) return false;
@@ -3126,17 +3145,13 @@ static bool saveTo(const std::string& path, bool withChips) {
     std::fprintf(f, "글자배율 %.3f\n", uiScale);
     std::fclose(f);
     // 다 쓴 다음에 갈아치운다. 쓰다 죽어도 예전 파일이 안 깨진다.
-    return std::rename(tmp.c_str(), path.c_str()) == 0;
+    return 갈아치우기(tmp, path);
 }
 
 // 칩만 따로 쓴다
 static bool saveChipsFile() {
     std::string path = chipsPath();
-    size_t slash = path.rfind('/');
-    if (slash != std::string::npos) {
-        std::string cmd = "mkdir -p '" + path.substr(0, slash) + "'";
-        if (std::system(cmd.c_str()) != 0) { }
-    }
+    폴더만들기(path);
     std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "w");
     if (!f) return false;
@@ -3148,7 +3163,7 @@ static bool saveChipsFile() {
         std::fprintf(f, "칩끝\n");
     }
     std::fclose(f);
-    return std::rename(tmp.c_str(), path.c_str()) == 0;
+    return 갈아치우기(tmp, path);
 }
 
 static bool saveState() { return saveTo(savePath(), false) && saveChipsFile(); }
@@ -5907,6 +5922,42 @@ static int runTests() {
         if (ok) std::snprintf(buf, sizeof(buf), "배율 넷 × 크기 셋 다 들어감 (제일 작은 글자 %d)", small);
         else    std::snprintf(buf, sizeof(buf), "%s", why);
         check("조작키 창이 창 안에 들어온다", ok, buf);
+    }
+
+    // 65. 두 번째 저장도 된다 (윈도우에서 rename 이 대상이 있으면 실패했다)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        char 곳[256];
+        std::snprintf(곳, sizeof(곳), "/tmp/semtle-두번저장/속/판.txt");
+        std::filesystem::remove_all("/tmp/semtle-두번저장");
+
+        int sw = addComp(world, SWITCH, 40, 40), lp = addComp(world, LAMP, 200, 40);
+        addWire(world, sw, 0, lp, 0);
+
+        bool 첫번 = saveTo(곳, true);
+        bool 폴더생김 = std::filesystem::exists("/tmp/semtle-두번저장/속");
+        auto 첫크기 = 첫번 ? std::filesystem::file_size(곳) : 0;
+
+        // 판을 바꾸고 같은 자리에 다시. 여기서 예전 코드가 윈도우에서 조용히 실패했다.
+        addComp(world, T_AND, 320, 40);
+        bool 두번 = saveTo(곳, true);
+        auto 두크기 = 두번 ? std::filesystem::file_size(곳) : 0;
+
+        bool 임시남음 = std::filesystem::exists(std::string(곳) + ".tmp");
+
+        // 진짜로 새 내용이 들어갔나
+        world = SubSim{}; chips.clear();
+        bool 읽힘 = loadFrom(곳);
+        int 부품수 = 0; for (auto& c : world.comps) if (c.alive) ++부품수;
+
+        std::filesystem::remove_all("/tmp/semtle-두번저장");
+        std::snprintf(buf, sizeof(buf),
+                      "폴더 %d, 첫 %d(%zu바이트), 둘 %d(%zu바이트), 임시 남음 %d, 다시 읽으니 부품 %d개",
+                      (int)폴더생김, (int)첫번, (size_t)첫크기, (int)두번, (size_t)두크기,
+                      (int)임시남음, 부품수);
+        check("같은 자리에 두 번 저장해도 된다",
+              폴더생김 && 첫번 && 두번 && 두크기 > 첫크기 && !임시남음 && 읽힘 && 부품수 == 3, buf);
+        world = SubSim{}; chips.clear();
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
