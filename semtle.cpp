@@ -6825,6 +6825,8 @@ int main(int argc, char** argv) {
                     SDL_Keycode k = e.key.keysym.sym;
                     bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
                     bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+                    // 조작키 창이 떠 있으면 아무 키나 닫기로 쓴다 (그 키는 안 먹는다)
+                    if (keysOn) { keysOn = false; break; }
                     // Esc: 고른 게 있으면 그것만 놓고, 없으면 나갈지 묻는다
                     if (k == SDLK_ESCAPE) {
                         if (tool != 0 || !sel.empty() || selWire >= 0) {
@@ -6837,7 +6839,12 @@ int main(int argc, char** argv) {
                     else if (k == SDLK_p)          paused = !paused;
                     else if (k == SDLK_BACKQUOTE)  tool = 0;
                     else if (k == SDLK_g)          startNaming();
-                    else if (k == SDLK_SLASH) { findOn = true; SDL_StartTextInput(); }
+                    else if (k == SDLK_SLASH || k == SDLK_QUESTION) {
+                        // ? 는 조작키, 그냥 / 는 부품 찾기.
+                        // 자판에 따라 SDLK_QUESTION 이 바로 오기도 한다.
+                        if (shift || k == SDLK_QUESTION) keysOn = true;
+                        else { findOn = true; SDL_StartTextInput(); }
+                    }
                     else if (k == SDLK_TAB) {
                         uiOn = !uiOn;
                         dropHandles();                 // 판이 사라지면 잡고 있던 것도 놓는다
@@ -6906,6 +6913,7 @@ int main(int argc, char** argv) {
 
                 case SDL_MOUSEBUTTONDOWN: {
                     mx = e.button.x; my = e.button.y;
+                    if (keysOn) { keysOn = false; break; }      // 눌러도 닫힌다
                     bool inPanel = uiOn && mx < PANEL_W;
 
                     // 학습 모드 오른쪽 설명판
@@ -7206,8 +7214,27 @@ int main(int argc, char** argv) {
             if (smokeLeft == 10) doGrade();                      // 못 푼 채로 채점
             if (smokeLeft == 6)  { lessonDone = LESSON_N; lessonAt = LESSON_N - 1;
                                    setupLesson(lessonAt); hintOn = true; }   // 마지막 단계 + 힌트
-            if (smokeLeft == 8)  keysOn = true;                  // 조작키 창
-            if (smokeLeft == 7)  keysOn = false;
+            // 조작키 창은 진짜 키를 눌러서 연다. 안에서 keysOn 만 켜면
+            // 키를 받는 코드가 통째로 빠져도 모른 채 지나간다 (실제로 그랬다).
+            if (smokeLeft == 9) {
+                keysOn = false;
+                SDL_SetModState(KMOD_LSHIFT);                    // ? = Shift + /
+                SDL_Event ev{}; ev.type = SDL_KEYDOWN;
+                ev.key.keysym.sym = SDLK_SLASH; ev.key.keysym.scancode = SDL_SCANCODE_SLASH;
+                SDL_PushEvent(&ev);
+            }
+            if (smokeLeft == 8) {
+                SDL_SetModState(KMOD_NONE);
+                if (!keysOn) { std::fprintf(stderr, "? 를 눌러도 조작키 창이 안 뜬다\n"); smokeBad = true; }
+            }
+            if (smokeLeft == 7) {                                // 아무 키나 누르면 닫힌다
+                SDL_Event ev{}; ev.type = SDL_KEYDOWN;
+                ev.key.keysym.sym = SDLK_p; ev.key.keysym.scancode = SDL_SCANCODE_P;
+                SDL_PushEvent(&ev);
+            }
+            if (smokeLeft == 6 && keysOn) {
+                std::fprintf(stderr, "조작키 창이 키를 눌러도 안 닫힌다\n"); smokeBad = true;
+            }
             if (smokeLeft == 4)  uiOn = false;                   // 학습 모드에서 판 숨기기
             if (smokeLeft == 2)  { uiOn = true; }
             if (--smokeLeft <= 0) running = false;
