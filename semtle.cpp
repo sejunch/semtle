@@ -3054,8 +3054,10 @@ static bool readSub(std::FILE* f, SubSim& s) {
                         &type, &chipId, &x, &y, &rot, &alive, &sw) != 7) return false;
         // aux 는 형식 2부터 있다. 예전 파일에는 아예 없다.
         if (fileVer >= 2 && std::fscanf(f, " %d", &aux) != 1) return false;
-        // 표에 없는 번호가 들어오면 파일이 깨진 것이다
-        if (chipId >= (int)chips.size()) return false;
+        // 없는 칩을 가리키면 그 자리만 죽은 채로 둔다.
+        // 파일을 통째로 물리면 칩 파일 하나 어긋났다고 판이 다 날아간다.
+        // 자리는 남겨야 한다 — 선이 부품을 번호로 가리키기 때문이다.
+        if (chipId >= (int)chips.size()) { chipId = -1; type = T_NOT; alive = 0; }
         if (chipId < 0 && (type < 0 || type >= TYPE_N)) return false;
         // 줄 나머지가 이름이다 (없으면 빈 칸 — 예전 저장본이 그렇다)
         char rest[160] = "";
@@ -3291,6 +3293,19 @@ static bool loadFrom(const std::string& path) {
 
     std::fclose(f);
     if (!ok) { chips = oldChips; world = oldWorld; }
+    // 없는 칩을 가리키는 상자는 치운다. 칩 파일이 지워졌거나 짝이 안 맞는
+    // 저장본을 읽으면 chips[번호] 가 판 밖을 짚어서 그대로 터진다.
+    if (ok) {
+        int 버림 = 0;
+        for (int i = 0; i < (int)world.comps.size(); ++i) {
+            Comp& c = world.comps[i];
+            if (!c.alive || c.chipId < 0) continue;
+            if (c.chipId >= (int)chips.size() || !chips[c.chipId].alive) {
+                deleteComp(world, i); ++버림;
+            }
+        }
+        if (버림) std::fprintf(stderr, "없는 부품을 가리키던 상자 %d개를 치웠다\n", 버림);
+    }
     return ok;
 }
 
@@ -3333,10 +3348,19 @@ static bool loadChipsFile() {
     return ok;
 }
 
-static bool loadState() {
+// 그 모드의 판을 읽는다. 칩을 먼저 읽어야 한다 — 판이 칩을 번호로 가리키기 때문이다.
+//
+// 예전엔 모드에 들어갈 때 판만 읽고 칩은 안 읽었다. 자동 저장 파일에는 칩이 안 들어
+// 있어서(칩은 chips.txt 에 따로 둔다), 만들어 둔 게이트가 통째로 사라졌다.
+// 학습에서만 멀쩡해 보였던 건 상품 칩을 repairLessonChips 가 매번 다시 만들어서였다.
+static bool loadMode(int sc) {
     chips.clear();
     loadChipsFile();                 // 칩은 모드와 상관없이 한 곳에서
-    return loadFrom(savePath());
+    return loadFrom(savePathFor(sc));
+}
+static bool loadState() {
+    int sc = (screen == SC_PICK) ? SC_LEARN : (screen == SC_MENU ? SC_SANDBOX : screen);
+    return loadMode(sc);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -5960,6 +5984,86 @@ static int runTests() {
         world = SubSim{}; chips.clear();
     }
 
+    // 66. 샌드박스에서 만든 게이트가 자동 저장에 남는다
+    //     (자동 저장은 판과 칩을 다른 파일에 쓴다. 칩 쪽만 빠지는 일이 있었다)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        std::filesystem::remove_all("/tmp/semtle-칩저장");
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-칩저장/판.txt", 1);
+
+        int a1 = addComp(world, PIN_IN, 40, 40), b1 = addComp(world, T_NOT, 160, 40);
+        int c1 = addComp(world, PIN_OUT, 280, 40);
+        addWire(world, a1, 0, b1, 0); addWire(world, b1, 0, c1, 0);
+        createChip({ a1, b1, c1 }, "내가만든것");
+        int 만든뒤 = 0; for (auto& c : chips) if (c.alive) ++만든뒤;
+
+        bool 썼다 = saveState();
+        bool 칩파일있음 = std::filesystem::exists(chipsPath());
+
+        chips.clear(); world = SubSim{};
+        bool 읽었다 = loadState();
+        bool 남음 = false;
+        for (auto& c : chips) if (c.alive && c.name == "내가만든것") 남음 = true;
+        int 읽은뒤 = 0; for (auto& c : chips) if (c.alive) ++읽은뒤;
+
+        // 판에 놓인 상자가 그 칩을 제대로 가리키나
+        int 상자 = -1;
+        for (int i = 0; i < (int)world.comps.size(); ++i)
+            if (world.comps[i].alive && world.comps[i].chipId >= 0) 상자 = i;
+        bool 상자맞음 = 상자 >= 0 && world.comps[상자].chipId < (int)chips.size()
+                     && chips[world.comps[상자].chipId].name == "내가만든것";
+
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-test-state.txt", 1);
+        std::filesystem::remove_all("/tmp/semtle-칩저장");
+        std::snprintf(buf, sizeof(buf),
+                      "만드니 칩 %d개, 씀 %d, 칩파일 %d, 읽으니 %d개·남음 %d, 판의 상자 %d",
+                      만든뒤, (int)썼다, (int)칩파일있음, 읽은뒤, (int)남음, (int)상자맞음);
+        check("만든 게이트가 자동 저장에 남는다",
+              만든뒤 == 1 && 썼다 && 칩파일있음 && 읽었다 && 남음 && 상자맞음, buf);
+        world = SubSim{}; chips.clear();
+    }
+
+    // 67. 모드에 들어갈 때 칩 파일을 읽는다
+    //     (안 읽어서 만들어 둔 게이트가 통째로 사라졌다)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        std::filesystem::remove_all("/tmp/semtle-모드칩");
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-모드칩/판.txt", 1);
+
+        // 한 판 만들어 저장한다
+        int a1 = addComp(world, PIN_IN, 40, 40), b1 = addComp(world, T_NOT, 160, 40);
+        int c1 = addComp(world, PIN_OUT, 280, 40);
+        addWire(world, a1, 0, b1, 0); addWire(world, b1, 0, c1, 0);
+        createChip({ a1, b1, c1 }, "내것");
+        saveState();
+
+        // 프로그램을 새로 켠 셈 친다 — 시작할 때처럼 다 비운다
+        chips.clear(); world = SubSim{};
+        bool 읽음 = loadMode(SC_SANDBOX);
+        bool 있음 = false;
+        for (auto& c : chips) if (c.alive && c.name == "내것") 있음 = true;
+        int 상자 = 0;
+        for (auto& c : world.comps) if (c.alive && c.chipId >= 0) ++상자;
+
+        // 칩 파일이 없어졌을 때 — 상자가 허공을 짚으면 안 된다
+        std::filesystem::remove(chipsPath());
+        chips.clear(); world = SubSim{};
+        bool 다시읽음 = loadMode(SC_SANDBOX);
+        bool 허공 = false;
+        for (auto& c : world.comps)
+            if (c.alive && c.chipId >= 0
+                && (c.chipId >= (int)chips.size() || !chips[c.chipId].alive)) 허공 = true;
+
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-test-state.txt", 1);
+        std::filesystem::remove_all("/tmp/semtle-모드칩");
+        std::snprintf(buf, sizeof(buf),
+                      "읽음 %d, 칩 남음 %d, 판의 상자 %d개 / 칩 파일 지우고 읽으니 %d, 허공 짚음 %d",
+                      (int)읽음, (int)있음, 상자, (int)다시읽음, (int)허공);
+        check("모드에 들어갈 때 칩 파일을 읽는다",
+              읽음 && 있음 && 상자 == 1 && 다시읽음 && !허공, buf);
+        world = SubSim{}; chips.clear();
+    }
+
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
     world = SubSim{}; chips.clear(); editStack.clear();
     return failed ? 1 : 0;
@@ -6172,7 +6276,7 @@ int main(int argc, char** argv) {
         dropHandles(); tool = 0; paused = false;
         undoStack.clear(); redoStack.clear();
         lesLeft = 0; lesMsg[0] = 0; hintOn = false;
-        if (!loadFrom(savePathFor(sc))) {          // 저장본이 없으면 처음부터
+        if (!loadMode(sc)) {                       // 저장본이 없으면 처음부터
             world = SubSim{}; chips.clear();
             if (sc == SC_SANDBOX) { seedDemo(); viewZoom = 1; viewX = viewY = 0; }
             else                  { lessonAt = lessonDone = 0; setupLesson(0); }
