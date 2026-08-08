@@ -3256,6 +3256,8 @@ static void migratePorts(SubSim& t) {
     }
 }
 
+static void 칩속다시맞추기();   // 앞선언 (loadFrom 도 쓴다)
+
 static bool loadFrom(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "r");
     if (!f) return false;
@@ -3276,7 +3278,7 @@ static bool loadFrom(const std::string& path) {
         fileVer = ver;
         if (std::fscanf(f, " 칩 %d", &n) != 1 || n < 0 || n > 5000) break;
         hadChips = (n > 0);
-        if (hadChips) chips.clear();         // 파일이 칩을 담고 있으면 그것으로 갈아친다
+        if (hadChips) chips.assign(n, Chip{});   // 자리를 미리 잡아 둔다 (뒤엣칩 가리키기)
         bool bad = false;
         for (int i = 0; i < n && !bad; ++i) {
             unsigned col = 0; int alive = 0;
@@ -3285,15 +3287,15 @@ static bool loadFrom(const std::string& path) {
             if (!std::fgets(name, sizeof(name), f)) { bad = true; break; }
             size_t len = std::strlen(name);
             while (len && (name[len-1] == '\n' || name[len-1] == '\r')) name[--len] = 0;
-            Chip ch; ch.name = name; ch.color = col; ch.alive = alive != 0;
-            // 뒤엣칩이 앞엣칩을 쓸 수 있으니 순서대로 넣어 가며 읽는다
-            chips.push_back(std::move(ch));
-            if (!readSub(f, chips.back().tmpl)) { bad = true; break; }
-            migratePorts(chips.back().tmpl);      // 예전 저장본의 스위치·전구 포트를 핀으로
+            // 자리는 미리 잡아 뒀다. 그래야 뒤에 올 칩을 가리켜도 살아남는다.
+            chips[i].name = name; chips[i].color = col; chips[i].alive = alive != 0;
+            if (!readSub(f, chips[i].tmpl)) { bad = true; break; }
+            migratePorts(chips[i].tmpl);          // 예전 저장본의 스위치·전구 포트를 핀으로
             char end[32] = "";
             if (std::fscanf(f, " %31s", end) != 1 || std::strcmp(end, "칩끝") != 0) bad = true;
         }
         if (bad) break;
+        if (hadChips) 칩속다시맞추기();
 
         char tag[32] = "";
         if (std::fscanf(f, " %31s", tag) != 1 || std::strcmp(tag, "판시작") != 0) break;
@@ -3343,6 +3345,38 @@ static bool loadFrom(const std::string& path) {
 }
 
 // 칩 파일 읽기
+// 상자 속을 설계도에서 다시 찍어 낸다.
+// 칩을 읽는 도중에는 뒤에 올 칩의 설계도가 아직 비어 있어서, 그때 만든 상자는
+// 속이 텅 비어 있다. 다 읽고 나서 한 번 더 찍어 내야 한다.
+static void 상자다시찍기(SubSim& s) {
+    for (auto& c : s.comps) {
+        if (c.chipId < 0 || c.chipId >= (int)chips.size()) continue;
+        c.sub = std::make_shared<SubSim>(deepCopy(chips[c.chipId].tmpl));
+        resizePorts(c);
+    }
+}
+
+// 칩이 서로를 쓰는 차례대로 훑으면서 속을 다시 찍는다.
+// 자기 안에 자기는 못 넣으므로 고리는 없다. 남는 것이 있으면 그냥 순서대로 한다.
+static void 칩속다시맞추기() {
+    int n = (int)chips.size();
+    std::vector<bool> 됐다(n, false);
+    for (int 돌 = 0; 돌 < n; ++돌) {
+        bool 뭔가했다 = false;
+        for (int i = 0; i < n; ++i) {
+            if (됐다[i]) continue;
+            bool 준비 = true;
+            for (const auto& c : chips[i].tmpl.comps)
+                if (c.chipId >= 0 && c.chipId < n && !됐다[c.chipId]) 준비 = false;
+            if (!준비) continue;
+            상자다시찍기(chips[i].tmpl);
+            됐다[i] = true; 뭔가했다 = true;
+        }
+        if (!뭔가했다) break;
+    }
+    for (int i = 0; i < n; ++i) if (!됐다[i]) 상자다시찍기(chips[i].tmpl);
+}
+
 static bool loadChipsFile() {
     std::FILE* f = std::fopen(chipsPath().c_str(), "r");
     if (!f) return false;
@@ -3356,7 +3390,9 @@ static bool loadChipsFile() {
         fileVer = ver;
         if (std::fscanf(f, " 칩 %d", &n) != 1 || n < 0 || n > 5000) break;
         std::vector<Chip> save = chips;
-        chips.clear();                       // readSub 이 chips 크기를 본다
+        // readSub 이 chips 크기로 칩 번호가 맞는지 본다. 자리를 미리 잡아 두면
+        // 뒤에 올 칩을 가리키는 상자도 살아남는다 (예전엔 죽은 부품이 됐다).
+        chips.assign(n, Chip{});
         bool bad = false;
         for (int i = 0; i < n && !bad; ++i) {
             unsigned col = 0; int alive = 0;
@@ -3365,14 +3401,14 @@ static bool loadChipsFile() {
             if (!std::fgets(name, sizeof(name), f)) { bad = true; break; }
             size_t len = std::strlen(name);
             while (len && (name[len-1] == '\n' || name[len-1] == '\r')) name[--len] = 0;
-            Chip ch; ch.name = name; ch.color = col; ch.alive = alive != 0;
-            chips.push_back(std::move(ch));
-            if (!readSub(f, chips.back().tmpl)) { bad = true; break; }
-            migratePorts(chips.back().tmpl);
+            chips[i].name = name; chips[i].color = col; chips[i].alive = alive != 0;
+            if (!readSub(f, chips[i].tmpl)) { bad = true; break; }
+            migratePorts(chips[i].tmpl);
             char end[32] = "";
             if (std::fscanf(f, " %31s", end) != 1 || std::strcmp(end, "칩끝") != 0) bad = true;
         }
         if (bad) { chips = save; break; }
+        칩속다시맞추기();                     // 뒤엣칩을 쓰는 상자들 속을 이제야 찍어 낸다
         got = chips;
         ok = true;
     } while (false);
@@ -6141,6 +6177,62 @@ static int runTests() {
                       (int)묶음맞음, (int)풀음맞음, 아래칸, 위칸, (int)게이트그대로);
         check("아랫자리가 아래에 있다", 묶음맞음 && 풀음맞음 && 뭉치맞음 && 게이트그대로, buf);
         world = SubSim{};
+    }
+
+    // 69. 나중에 만든 칩을 먼저 만든 칩이 써도 살아남는다
+    //     (파일을 위에서부터 읽으면서 '아직 없는 칩' 으로 쳐서 죽은 부품이 됐다)
+    {
+        screen = SC_SANDBOX; world = SubSim{}; chips.clear(); editStack.clear();
+        std::filesystem::remove_all("/tmp/semtle-칩차례");
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-칩차례/판.txt", 1);
+
+        // 1) 먼저 '겉' 을 만든다 (아직 아무것도 안 쓴다)
+        int a1 = addComp(world, PIN_IN, 40, 40), b1 = addComp(world, T_NOT, 160, 40);
+        int c1 = addComp(world, PIN_OUT, 280, 40);
+        addWire(world, a1, 0, b1, 0); addWire(world, b1, 0, c1, 0);
+        createChip({ a1, b1, c1 }, "겉");
+
+        // 2) 그다음 '속' 을 만든다 — 겉보다 뒤에 온다
+        world = SubSim{};
+        int a2 = addComp(world, PIN_IN, 40, 40), b2 = addComp(world, T_NOT, 160, 40);
+        int c2 = addComp(world, PIN_OUT, 280, 40);
+        addWire(world, a2, 0, b2, 0); addWire(world, b2, 0, c2, 0);
+        createChip({ a2, b2, c2 }, "속");
+
+        int 겉 = -1, 속 = -1;
+        for (int i = 0; i < (int)chips.size(); ++i) {
+            if (chips[i].name == "겉") 겉 = i;
+            if (chips[i].name == "속") 속 = i;
+        }
+        // 3) 겉을 고쳐서 속을 집어넣는다 (먼저 만든 것이 나중 것을 쓴다)
+        bool 뒤엣것 = (겉 >= 0 && 속 > 겉);
+        SubSim& t = chips[겉].tmpl;
+        int 상자 = addChip(t, 속, 400, 40);
+        bool 넣었다 = (상자 >= 0);
+
+        saveState();
+        chips.clear(); world = SubSim{};
+        bool 읽음 = loadMode(SC_SANDBOX);
+
+        // 겉 안의 상자가 살아 있고 속을 제대로 가리키나
+        int 산상자 = 0; bool 속가리킴 = false, 속찼음 = false;
+        if (읽음 && 겉 < (int)chips.size()) {
+            for (const auto& c : chips[겉].tmpl.comps) {
+                if (!c.alive || c.chipId < 0) continue;
+                ++산상자;
+                if (c.chipId == 속) 속가리킴 = true;
+                if (c.sub && !c.sub->comps.empty()) 속찼음 = true;   // 속이 텅 비면 안 된다
+            }
+        }
+
+        SDL_setenv("SEMTLE_SAVE", "/tmp/semtle-test-state.txt", 1);
+        std::filesystem::remove_all("/tmp/semtle-칩차례");
+        std::snprintf(buf, sizeof(buf),
+                      "겉%d 속%d(뒤엣것 %d), 넣음 %d, 읽음 %d, 산 상자 %d, 속 가리킴 %d, 속 찼음 %d",
+                      겉, 속, (int)뒤엣것, (int)넣었다, (int)읽음, 산상자, (int)속가리킴, (int)속찼음);
+        check("나중에 만든 칩을 먼저 만든 칩이 써도 된다",
+              뒤엣것 && 넣었다 && 읽음 && 산상자 == 1 && 속가리킴 && 속찼음, buf);
+        world = SubSim{}; chips.clear();
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
