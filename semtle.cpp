@@ -935,9 +935,18 @@ static int compW(const Comp& c) { return (c.rot & 1) ? baseH(c) : baseW(c); }
 static int compH(const Comp& c) { return (c.rot & 1) ? baseW(c) : baseH(c); }
 
 // 어느 변에 포트를 늘어놓을지: side 0=오른, 1=아래, 2=왼, 3=위
+// 묶음·풀음의 자릿수 포트는 아랫자리가 아래로 가게 뒤집는다.
+// 스위치묶음과 폭 있는 입력핀은 맨 아래 칸이 1의 자리인데, 묶음만 반대라서
+// (0번이 맨 위) 늘 헷갈렸다. 번호는 그대로 두고 놓이는 자리만 뒤집으므로
+// 이미 만들어 둔 회로와 저장본은 하나도 안 바뀐다.
+static bool 자릿수포트(const Comp& c) {
+    return c.chipId < 0 && (c.type == BUNDLE || c.type == SPLIT);
+}
+
 static void portOnSide(const Comp& c, int side, int i, int n, int& px, int& py) {
     int w = compW(c), h = compH(c);
     n = std::max(1, n);
+    if (자릿수포트(c) && n > 1) i = n - 1 - i;
     switch (side) {
         case 0: px = c.x + w;             py = c.y + h * (i + 1) / (n + 1); break;
         case 1: px = c.x + w * (i+1)/(n+1); py = c.y + h;                   break;
@@ -2482,6 +2491,28 @@ static Rect toScreen(int wx, int wy, int ww, int wh) {
 
 // 굵은 선(여러 비트) 포트는 네모로, 한 비트짜리는 동그라미로 그린다.
 // 색도 선이랑 맞춘다 — 굵은 쪽은 파랑끼, 가는 쪽은 초록.
+// 묶음·풀음 포트 옆에 그 자리의 값을 적는다 (1 2 4 8 16 …).
+// 1024부터는 자리가 좁아서 1k·2k 로 줄인다.
+static const char* 자릿값(int i) {
+    static const char* T[16] = { "1","2","4","8","16","32","64","128",
+                                 "256","512","1k","2k","4k","8k","16k","32k" };
+    return (i >= 0 && i < 16) ? T[i] : "";
+}
+
+static void 자릿수쓰기(SDL_Renderer* ren, const Comp& c, int p, int px, int py, bool 입력쪽) {
+    if (!자릿수포트(c)) return;
+    int n = 입력쪽 ? nIn(c) : nOut(c);
+    if (n <= 1) return;                       // 굵은 선 쪽에는 안 적는다
+    if (viewZoom < 0.55f) return;             // 너무 작으면 글자가 뭉갠다
+    const char* t = 자릿값(p);
+    int sx = w2sX((float)px), sy = w2sY((float)py);
+    int 안쪽 = (c.rot & 1) ? 0 : (입력쪽 ? 1 : -1);   // 상자 안쪽으로 밀어 넣기
+    int 글자 = std::max(8, w2sLen(11));
+    int w = textWidthPx(글자, t);
+    drawTextPx(ren, sx + (안쪽 >= 0 ? w2sLen(8) : -w2sLen(8) - w), sy - 글자/2,
+               글자, 0xB4BCCC, t);
+}
+
 static void drawPort(SDL_Renderer* ren, int sx, int sy, int r, int width, bool on) {
     if (width <= 1) {
         fillCircle(ren, sx, sy, r, on ? COL_ON : COL_OFF);
@@ -2655,12 +2686,14 @@ static void drawComp(SDL_Renderer* ren, int idx, const std::vector<int>& sel) {
         bool v = p < (int)c.out.size() && c.out[p] != 0;
         int wd = p < (int)c.outW.size() ? c.outW[p] : 1;
         drawPort(ren, w2sX((float)px), w2sY((float)py), pr, wd, v);
+        자릿수쓰기(ren, c, p, px, py, false);
     }
     for (int p = 0; p < nIn(c); ++p) {
         int px, py; inPort(c, p, px, py);
         bool v = p < (int)c.in.size() && c.in[p] != 0;
         int wd = p < (int)c.inW.size() ? c.inW[p] : 1;
         drawPort(ren, w2sX((float)px), w2sY((float)py), pr, wd, v);
+        자릿수쓰기(ren, c, p, px, py, true);
     }
 }
 
@@ -6062,6 +6095,52 @@ static int runTests() {
         check("모드에 들어갈 때 칩 파일을 읽는다",
               읽음 && 있음 && 상자 == 1 && 다시읽음 && !허공, buf);
         world = SubSim{}; chips.clear();
+    }
+
+    // 68. 묶음·풀음은 아랫자리가 아래에 있다 (스위치묶음과 같게)
+    {
+        world = SubSim{}; chips.clear();
+        int bu = addComp(world, BUNDLE, 100, 100);
+        world.comps[bu].aux = 8; resizePorts(world.comps[bu]);
+        int sp = addComp(world, SPLIT, 300, 100);
+        world.comps[sp].aux = 8; resizePorts(world.comps[sp]);
+        int sb = addComp(world, SWBANK, 500, 100);
+        world.comps[sb].aux = 8; resizePorts(world.comps[sb]);
+
+        // 묶음 0번(1의 자리)이 7번보다 아래에 있어야 한다
+        int x0, y0, x7, y7;
+        inPort(world.comps[bu], 0, x0, y0);
+        inPort(world.comps[bu], 7, x7, y7);
+        bool 묶음맞음 = y0 > y7;
+
+        int ox0, oy0, ox7, oy7;
+        outPort(world.comps[sp], 0, ox0, oy0);
+        outPort(world.comps[sp], 7, ox7, oy7);
+        bool 풀음맞음 = oy0 > oy7;
+
+        // 스위치묶음도 아래가 1의 자리 (누르는 자리로 확인)
+        // 위에서 아래로 훑어서 처음 잡히는 칸과 마지막 칸을 본다
+        const Comp& b2 = world.comps[sb];
+        int 위칸 = -1, 아래칸 = -1;
+        for (int y = b2.y; y < b2.y + compH(b2); ++y) {
+            int i = swBankBitAt(b2, b2.x + compW(b2)/2, y);
+            if (i < 0) continue;
+            if (위칸 < 0) 위칸 = i;
+            아래칸 = i;
+        }
+        bool 뭉치맞음 = (아래칸 == 0 && 위칸 == 7);
+
+        // 게이트처럼 자릿수가 아닌 포트는 그대로여야 한다
+        int an = addComp(world, T_AND, 700, 100);
+        int a0y, a1y, tx;
+        inPort(world.comps[an], 0, tx, a0y);
+        inPort(world.comps[an], 1, tx, a1y);
+        bool 게이트그대로 = a0y < a1y;
+
+        std::snprintf(buf, sizeof(buf), "묶음 %d, 풀음 %d, 스위치묶음 아래=%d·위=%d, 게이트 %d",
+                      (int)묶음맞음, (int)풀음맞음, 아래칸, 위칸, (int)게이트그대로);
+        check("아랫자리가 아래에 있다", 묶음맞음 && 풀음맞음 && 뭉치맞음 && 게이트그대로, buf);
+        world = SubSim{};
     }
 
     std::printf("\n%s\n", failed ? "실패 있음" : "전부 통과");
